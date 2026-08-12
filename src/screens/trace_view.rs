@@ -21,6 +21,8 @@ const TICKS: usize = 5;
 #[derive(Props, Clone, PartialEq)]
 pub struct TraceViewProps {
     pub trace: Trace,
+    /// Field values that mark a step as failed.
+    pub rules: Vec<trace::ErrorRule>,
     /// Currently selected lane field; empty means containers.
     pub lane_id: String,
     /// Selectable lane fields as `(id, label)`.
@@ -43,6 +45,14 @@ pub fn TraceView(props: TraceViewProps) -> Element {
         .filter(|l| l.state == LaneState::OffPath)
         .collect();
     let ticks = axis_ticks(trace, track_w);
+    // A red card can sit far off-screen on a wide timeline, so the count has
+    // to be visible without scrolling to find it.
+    let errored = trace
+        .lanes
+        .iter()
+        .flat_map(|l| l.blocks.iter())
+        .filter(|b| trace::is_error(&b.doc, &props.rules))
+        .count();
 
     rsx! {
         div { class: "panel trace-panel",
@@ -51,6 +61,9 @@ pub fn TraceView(props: TraceViewProps) -> Element {
                 span { class: "chip ok", "{trace.reached()} reached" }
                 if trace.awaiting() > 0 {
                     span { class: "chip warn", "{trace.awaiting()} awaiting" }
+                }
+                if errored > 0 {
+                    span { class: "chip bad", "{errored} errored" }
                 }
                 span { class: "chip muted", "{trace.blocks_found} documents" }
                 div { class: "spacer" }
@@ -95,6 +108,7 @@ pub fn TraceView(props: TraceViewProps) -> Element {
                         for placed in lanes.iter() {
                             LaneRow {
                                 lane: placed.clone(),
+                                rules: props.rules.clone(),
                                 start: trace.span.map(|(lo, _)| lo),
                                 selected: props.selected.clone(),
                                 on_select: props.on_select,
@@ -128,6 +142,7 @@ struct PlacedLane {
 #[derive(Props, Clone, PartialEq)]
 struct LaneRowProps {
     lane: PlacedLane,
+    rules: Vec<trace::ErrorRule>,
     start: Option<i64>,
     selected: Option<String>,
     on_select: EventHandler<String>,
@@ -172,7 +187,16 @@ fn LaneRow(props: LaneRowProps) -> Element {
                     _ => rsx! {
                         for (x, block) in props.lane.blocks.iter() {
                             div {
-                                class: if props.selected.as_deref() == Some(block.id.as_str()) { "block selected" } else { "block" },
+                                class: {
+                                    let mut c = String::from("block");
+                                    if trace::is_error(&block.doc, &props.rules) {
+                                        c.push_str(" errored");
+                                    }
+                                    if props.selected.as_deref() == Some(block.id.as_str()) {
+                                        c.push_str(" selected");
+                                    }
+                                    c
+                                },
                                 style: "left:{x}px; width:{CARD_W}px;",
                                 title: "{block.label}",
                                 onclick: {

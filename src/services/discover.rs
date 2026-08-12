@@ -121,6 +121,38 @@ pub fn field_values(schemas: &[ContainerSchema], lower_path: &str) -> Vec<String
     out.into_iter().map(str::to_string).collect()
 }
 
+/// Every scalar field in the account, for pickers that need the full list
+/// rather than a ranked subset — an error flag can live on any field, however
+/// unremarkable, so this deliberately does no filtering beyond "has a value
+/// you could compare against".
+pub fn scalar_fields(schemas: &[ContainerSchema]) -> Vec<RoleCandidate> {
+    let mut by_key: BTreeMap<String, (String, Vec<String>)> = BTreeMap::new();
+
+    for schema in schemas {
+        let path = schema.path();
+        for field in &schema.fields {
+            if SYSTEM_FIELDS.contains(&field.name.as_str()) || !field.is_scalar() {
+                continue;
+            }
+            let entry = by_key
+                .entry(field.name.to_lowercase())
+                .or_insert_with(|| (field.name.clone(), Vec::new()));
+            entry.1.push(path.clone());
+        }
+    }
+
+    by_key
+        .into_iter()
+        .map(|(id, (label, containers))| RoleCandidate {
+            score: containers.len() as f32,
+            note: format!("in {} container(s)", containers.len()),
+            id,
+            label,
+            containers,
+        })
+        .collect()
+}
+
 // ── Correlation keys ──────────────────────────────────────────────────────
 
 struct Node<'a> {
@@ -726,6 +758,32 @@ mod tests {
         );
         assert!(field_values(&schemas, "").is_empty());
         assert!(field_values(&schemas, "nosuchfield").is_empty());
+    }
+
+    /// The error-rule picker must offer numeric flags like `sessionStatus`,
+    /// which the ranked role lists filter out as too low-cardinality.
+    #[test]
+    fn scalar_fields_includes_numeric_flags_the_role_lists_reject() {
+        let numeric = FieldInfo {
+            name: "sessionStatus".into(),
+            types: vec!["number".into()],
+            seen_in: 20,
+            distinct: 2,
+            values: ["2", "3"].iter().map(|s| s.to_string()).collect(),
+        };
+        let schemas = vec![container(
+            "ais",
+            "MsgItems",
+            vec![numeric, field("correlationId", &uuids())],
+        )];
+
+        let offered = scalar_fields(&schemas);
+        let ids: Vec<&str> = offered.iter().map(|f| f.id.as_str()).collect();
+        assert!(
+            ids.contains(&"sessionstatus"),
+            "numeric fields must be offerable as error flags, got {ids:?}"
+        );
+        assert_eq!(field_values(&schemas, "sessionstatus"), vec!["2", "3"]);
     }
 
     #[test]

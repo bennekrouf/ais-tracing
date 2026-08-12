@@ -1,5 +1,5 @@
 use crate::screens::trace_view::TraceView;
-use crate::services::{az::CosmosAccount, cosmos, discover, history, trace};
+use crate::services::{az::CosmosAccount, cache, cosmos, discover, history, trace};
 use dioxus::prelude::*;
 use std::collections::BTreeSet;
 
@@ -28,10 +28,15 @@ pub struct HomeProps {
 #[component]
 pub fn Home(props: HomeProps) -> Element {
     let account = props.account.clone();
-    let mut tab = use_signal(|| Tab::Setup);
+    // Tracing is the job; setup is the thing you do once. Land on the work.
+    let mut tab = use_signal(|| Tab::Trace);
     let mut state = use_signal(|| LoadState::Idle);
     let mut schemas = use_signal(Vec::<cosmos::ContainerSchema>::new);
     let mut granting = use_signal(|| false);
+    // A refresh running behind cached data, and how old that data is.
+    let mut refreshing = use_signal(|| false);
+    let mut refresh_error = use_signal(|| Option::<String>::None);
+    let mut scanned_at = use_signal(|| Option::<i64>::None);
 
     // What the user is tracing on: the key that links steps, the field that
     // orders them, the field that names them.
@@ -41,39 +46,70 @@ pub fn Home(props: HomeProps) -> Element {
     // Empty = one lane per Cosmos container, the physical default.
     let mut lane_id = use_signal(String::new);
 
-    let mut traced = use_signal(|| Option::<trace::Trace>::None);
-    let mut tracing = use_signal(|| false);
+    let traced = use_signal(|| Option::<trace::Trace>::None);
+    let tracing = use_signal(|| false);
     let mut selected_block = use_signal(|| Option::<String>::None);
     let mut recent = use_signal({
         let endpoint = account.endpoint.clone();
         move || history::load(&endpoint)
     });
+    let mut rules = use_signal({
+        let endpoint = account.endpoint.clone();
+        move || history::load_rules(&endpoint)
+    });
 
     let insights = use_memo(move || discover::analyze(&schemas.read()));
 
+    // `background` means we already have cached schemas on screen: refresh
+    // without blanking them, and keep them if the refresh fails.
     let run_scan = {
         let account = account.clone();
-        move || {
+        move |background: bool| {
             let account = account.clone();
-            state.set(LoadState::Loading);
-            schemas.set(Vec::new());
+            if !background {
+                state.set(LoadState::Loading);
+                schemas.set(Vec::new());
+            }
+            refreshing.set(true);
+            refresh_error.set(None);
             spawn(async move {
                 match scan_account(&account.endpoint).await {
                     Ok(found) => {
+                        cache::save(&account.endpoint, &found);
+                        scanned_at.set(Some(chrono::Utc::now().timestamp()));
                         schemas.set(found);
                         state.set(LoadState::Done);
                     }
-                    Err(e) => state.set(LoadState::Failed(e)),
+                    Err(e) => {
+                        if background {
+                            // Cached data is still on screen and still useful;
+                            // say the refresh failed rather than discarding it.
+                            refresh_error.set(Some(e));
+                        } else {
+                            state.set(LoadState::Failed(e));
+                        }
+                    }
                 }
+                refreshing.set(false);
             });
         }
     };
 
-    // Kick off automatically on first mount so there's something to look at
-    // right after connecting.
+    // Open on the last scan if we have one, so the window is usable
+    // immediately, then refresh behind it. Otherwise this is a cold start.
     use_effect({
+        let endpoint = account.endpoint.clone();
         let mut run_scan = run_scan.clone();
-        move || run_scan()
+        move || {
+            let cached = cache::load(&endpoint);
+            let warm = cached.is_some();
+            if let Some(cached) = cached {
+                scanned_at.set(Some(cached.scanned_at));
+                schemas.set(cached.schemas);
+                state.set(LoadState::Done);
+            }
+            run_scan(warm);
+        }
     });
 
     // Propose the best-evidenced choice for each role, but only as a default:
@@ -89,6 +125,39 @@ pub fn Home(props: HomeProps) -> Element {
         let lane = lane_id.peek().clone();
         if !lane.is_empty() && !insights.labels.iter().any(|c| c.id == lane) {
             lane_id.set(String::new());
+        }
+    });
+
+    let follow = Follow {
+        insights,
+        key_id,
+        time_id,
+        label_id,
+        recent,
+        traced,
+        tracing,
+        selected: selected_block,
+    };
+
+    // Land on something rather than an empty box: once the scan has settled on
+    // a key, replay the value traced last. Guarded so it happens once per
+    // session — re-running it on every rescan would fight the user.
+    let mut autoloaded = use_signal(|| false);
+    use_effect({
+        let endpoint = account.endpoint.clone();
+        move || {
+            let ready = matches!(&*state.read(), LoadState::Done) && !key_id.read().is_empty();
+            if !ready || *autoloaded.peek() {
+                return;
+            }
+            // `peek` deliberately: `run` writes to `recent`, and subscribing
+            // here would loop.
+            let Some(last) = recent.peek().first().cloned() else {
+                autoloaded.set(true);
+                return;
+            };
+            autoloaded.set(true);
+            follow.run(&endpoint, last.value);
         }
     });
 
@@ -129,6 +198,13 @@ pub fn Home(props: HomeProps) -> Element {
     rsx! {
         div { class: "app-shell",
         div { class: "topbar",
+            // Leftmost, same as ais-monitor: back is navigation, not an action
+            // on the current view.
+            button {
+                class: "btn btn-back",
+                onclick: move |_| props.on_back.call(()),
+                "‹ Back"
+            }
             h1 { "ais-tracing" }
             span { class: "account-tag", "{account.name}  ({account.resource_group})" }
 
@@ -150,15 +226,32 @@ pub fn Home(props: HomeProps) -> Element {
             }
 
             div { class: "spacer" }
+
+            // Say where the data came from and how old it is, so cached
+            // content is never mistaken for a fresh read.
+            if *refreshing.read() {
+                span { class: "scan-state", span { class: "dot pulse" } "refreshing…" }
+            } else if let Some(e) = refresh_error.read().clone() {
+                span { class: "scan-state stale", title: "{e}",
+                    span { class: "dot error" }
+                    "refresh failed — showing cached"
+                }
+            } else if let Some(at) = *scanned_at.read() {
+                span { class: "scan-state", "sampled {cache::age(at)}" }
+            }
+
             button {
                 class: "btn",
+                disabled: *refreshing.read(),
                 onclick: {
                     let mut run_scan = run_scan.clone();
-                    move |_| run_scan()
+                    // Explicit rescan keeps the cached view up while it runs —
+                    // blanking the screen on a manual refresh is a regression
+                    // from just leaving it there.
+                    move |_| run_scan(true)
                 },
                 "↻ Rescan"
             }
-            button { class: "btn-back", onclick: move |_| props.on_back.call(()), "← Back" }
         }
 
         div { class: "screen-split",
@@ -197,7 +290,7 @@ pub fn Home(props: HomeProps) -> Element {
                                                 match result {
                                                     Ok(Ok(())) => {
                                                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                                                        run_scan();
+                                                        run_scan(true);
                                                     }
                                                     Ok(Err(e)) => state.set(LoadState::Failed(format!("Grant failed: {e}"))),
                                                     Err(e) => state.set(LoadState::Failed(format!("Grant failed: {e}"))),
@@ -235,6 +328,19 @@ pub fn Home(props: HomeProps) -> Element {
                                     }
                                 }
 
+                                ErrorRules {
+                                    fields: discover::scalar_fields(&schemas.read()),
+                                    schemas: schemas.read().clone(),
+                                    rules: rules.read().clone(),
+                                    on_change: {
+                                        let endpoint = account.endpoint.clone();
+                                        move |next: Vec<trace::ErrorRule>| {
+                                            history::save_rules(&endpoint, &next);
+                                            rules.set(next);
+                                        }
+                                    },
+                                }
+
                                 ContainerList {
                                     schemas: schemas.read().clone(),
                                     trace_key: key.clone(),
@@ -249,40 +355,8 @@ pub fn Home(props: HomeProps) -> Element {
                                         move |_| recent.set(history::clear(&endpoint))
                                     },
                                     on_follow: {
-                                        let containers = insights.containers.clone();
-                                        let facts: Vec<String> = insights
-                                            .labels
-                                            .iter()
-                                            .take(6)
-                                            .map(|c| c.id.clone())
-                                            .collect();
                                         let endpoint = account.endpoint.clone();
-                                        move |value: String| {
-                                            recent.set(history::record(
-                                                &endpoint,
-                                                history::Entry {
-                                                    value: value.clone(),
-                                                    key: key.label.clone(),
-                                                },
-                                            ));
-                                            let spec = trace::TraceSpec {
-                                                key: key.clone(),
-                                                value,
-                                                time_field: time_id.peek().clone(),
-                                                label_field: label_id.peek().clone(),
-                                                fact_fields: facts.clone(),
-                                            };
-                                            let endpoint = endpoint.clone();
-                                            let containers = containers.clone();
-                                            tracing.set(true);
-                                            selected_block.set(None);
-                                            spawn(async move {
-                                                let result =
-                                                    trace::run(&endpoint, &containers, &spec).await;
-                                                traced.set(Some(result));
-                                                tracing.set(false);
-                                            });
-                                        }
+                                        move |value: String| follow.run(&endpoint, value)
                                     },
                                 }
                             }
@@ -293,6 +367,7 @@ pub fn Home(props: HomeProps) -> Element {
                                 } else if let Some(t) = shown.read().clone() {
                                     TraceView {
                                         trace: t,
+                                        rules: rules.read().clone(),
                                         lane_id: lane_id.read().clone(),
                                         lane_options: lane_options.clone(),
                                         on_lane: move |v: String| lane_id.set(v),
@@ -325,6 +400,64 @@ pub fn Home(props: HomeProps) -> Element {
         }
         }
         }
+    }
+}
+
+/// Everything needed to start a trace, bundled so the button and the
+/// auto-load on startup share one code path instead of drifting apart.
+/// Signals and memos are `Copy`, so this is too.
+#[derive(Clone, Copy)]
+struct Follow {
+    insights: Memo<discover::Insights>,
+    key_id: Signal<String>,
+    time_id: Signal<String>,
+    label_id: Signal<String>,
+    recent: Signal<Vec<history::Entry>>,
+    traced: Signal<Option<trace::Trace>>,
+    tracing: Signal<bool>,
+    selected: Signal<Option<String>>,
+}
+
+impl Follow {
+    fn run(mut self, endpoint: &str, value: String) {
+        let (key, containers, facts) = {
+            let insights = self.insights.peek();
+            let Some(key) = insights
+                .keys
+                .iter()
+                .find(|c| c.id == *self.key_id.peek())
+                .cloned()
+            else {
+                return;
+            };
+            let facts = insights.labels.iter().take(6).map(|c| c.id.clone()).collect();
+            (key, insights.containers.clone(), facts)
+        };
+
+        self.recent.set(history::record(
+            endpoint,
+            history::Entry {
+                value: value.clone(),
+                key: key.label.clone(),
+            },
+        ));
+
+        let spec = trace::TraceSpec {
+            key,
+            value,
+            time_field: self.time_id.peek().clone(),
+            label_field: self.label_id.peek().clone(),
+            fact_fields: facts,
+        };
+
+        let endpoint = endpoint.to_string();
+        self.tracing.set(true);
+        self.selected.set(None);
+        spawn(async move {
+            let result = trace::run(&endpoint, &containers, &spec).await;
+            self.traced.set(Some(result));
+            self.tracing.set(false);
+        });
     }
 }
 
@@ -530,7 +663,15 @@ struct FollowValueProps {
 /// flow, this asks which flow.
 #[component]
 fn FollowValue(props: FollowValueProps) -> Element {
-    let mut value = use_signal(String::new);
+    // Prefilled with the most recent value, which is also the one auto-traced
+    // on launch — an empty box above a populated timeline reads as a mismatch.
+    let mut value = use_signal(|| {
+        props
+            .recent
+            .first()
+            .map(|e| e.value.clone())
+            .unwrap_or_default()
+    });
     let ready = !value.read().trim().is_empty() && !props.disabled;
 
     let submit = move |_| {
@@ -611,6 +752,212 @@ fn shorten(value: &str) -> String {
     format!("{head}…{tail}")
 }
 
+
+#[derive(Props, Clone, PartialEq)]
+struct ErrorRulesProps {
+    fields: Vec<discover::RoleCandidate>,
+    schemas: Vec<cosmos::ContainerSchema>,
+    rules: Vec<trace::ErrorRule>,
+    on_change: EventHandler<Vec<trace::ErrorRule>>,
+}
+
+/// Teaches the app which field values mean failure.
+///
+/// Nothing here is inferred: `sessionStatus = 3` is meaningful only because
+/// someone says it is, and guessing would be worse than not colouring cards
+/// at all.
+#[component]
+fn ErrorRules(props: ErrorRulesProps) -> Element {
+    let mut field = use_signal(String::new);
+    let mut value = use_signal(String::new);
+    let mut filter = use_signal(String::new);
+
+    let chosen = field.read().clone();
+
+    // A busy account has a hundred-odd scalar fields, which makes an
+    // alphabetical dropdown useless for finding one you can already name.
+    // Ids are stored lowercased, so the needle matches directly.
+    let needle = filter.read().trim().to_lowercase();
+    let matches: Vec<&discover::RoleCandidate> = props
+        .fields
+        .iter()
+        // The chosen field always stays in the list: if filtering could drop
+        // it, the select would silently fall back to its first option and
+        // change the selection out from under the user.
+        .filter(|f| needle.is_empty() || f.id.contains(&needle) || f.id == chosen)
+        .collect();
+    // The values actually sampled for the chosen field, so the common case is
+    // clicking one rather than remembering what the codes are.
+    let observed = discover::field_values(&props.schemas, &chosen);
+    let label = props
+        .fields
+        .iter()
+        .find(|f| f.id == chosen)
+        .map(|f| f.label.clone())
+        .unwrap_or_default();
+    let ready = !chosen.is_empty() && !value.read().trim().is_empty();
+
+    // EventHandler is Copy and the rule list is not, so each handler takes its
+    // own clone rather than sharing one closure across two call sites.
+    let on_change = props.on_change;
+    let current = props.rules.clone();
+
+    rsx! {
+        div { class: "panel",
+            div { class: "panel-head",
+                h3 { "Error rules" }
+                if !props.rules.is_empty() {
+                    span { class: "chip warn", "{props.rules.len()} active" }
+                }
+            }
+            p { class: "meta", "Cards matching any of these are drawn in red." }
+
+            if !props.rules.is_empty() {
+                div { class: "rule-list",
+                    for rule in props.rules.iter() {
+                        span { class: "rule-chip",
+                            "{rule.label()}"
+                            button {
+                                class: "rule-drop",
+                                title: "Remove this rule",
+                                onclick: {
+                                    let (rule, current) = (rule.clone(), current.clone());
+                                    move |_| {
+                                        let next: Vec<_> = current
+                                            .iter()
+                                            .filter(|r| **r != rule)
+                                            .cloned()
+                                            .collect();
+                                        on_change.call(next);
+                                    }
+                                },
+                                "✕"
+                            }
+                        }
+                    }
+                }
+            }
+
+            div { class: "rule-form",
+                div { class: "az-field",
+                    label { "Field" }
+                    input {
+                        class: "field-filter",
+                        r#type: "text",
+                        placeholder: "filter… e.g. status",
+                        value: "{filter}",
+                        oninput: move |e| filter.set(e.value()),
+                    }
+                    // An inline list rather than a dropdown: a native select
+                    // stays shut while you type in a separate box, so the
+                    // filtering would be invisible at the moment it matters.
+                    div { class: "field-list",
+                        if matches.is_empty() {
+                            div { class: "field-empty", "no field matches “{needle}”" }
+                        }
+                        for f in matches.iter() {
+                            button {
+                                class: if chosen == f.id { "field-option on" } else { "field-option" },
+                                title: "{f.id}",
+                                onclick: {
+                                    let id = f.id.clone();
+                                    move |_| {
+                                        field.set(id.clone());
+                                        value.set(String::new());
+                                    }
+                                },
+                                span { class: "field-option-name", "{f.label}" }
+                                span { class: "field-option-note", "{f.note}" }
+                            }
+                        }
+                    }
+                    span { class: "meta",
+                        if needle.is_empty() {
+                            "{props.fields.len()} fields"
+                        } else {
+                            "{matches.len()} of {props.fields.len()} fields"
+                        }
+                    }
+                }
+                div { class: "az-field",
+                    label {
+                        if label.is_empty() {
+                            "Means failure when it equals"
+                        } else {
+                            "Means failure when {label} equals"
+                        }
+                    }
+                    input {
+                        r#type: "text",
+                        placeholder: "e.g. 3",
+                        value: "{value}",
+                        oninput: move |e| value.set(e.value()),
+                        onkeydown: {
+                            let (current, label) = (current.clone(), label.clone());
+                            move |e: KeyboardEvent| {
+                                if e.key() == Key::Enter && ready {
+                                    commit(&current, &mut field, &mut value, &label, on_change);
+                                }
+                            }
+                        },
+                    }
+                }
+                button {
+                    class: "btn",
+                    disabled: !ready,
+                    onclick: {
+                        let (current, label) = (current.clone(), label.clone());
+                        move |_| commit(&current, &mut field, &mut value, &label, on_change)
+                    },
+                    "Add rule"
+                }
+            }
+
+            if !chosen.is_empty() && !observed.is_empty() {
+                div { class: "rule-observed",
+                    span { class: "meta", "sampled values:" }
+                    for v in observed.iter().take(12) {
+                        button {
+                            class: "value-chip",
+                            onclick: {
+                                let v = v.clone();
+                                move |_| value.set(v.clone())
+                            },
+                            "{v}"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Appends the pending field/value as a rule, ignoring duplicates, and clears
+/// the value box ready for the next one.
+fn commit(
+    current: &[trace::ErrorRule],
+    field: &mut Signal<String>,
+    value: &mut Signal<String>,
+    display: &str,
+    on_change: EventHandler<Vec<trace::ErrorRule>>,
+) {
+    let field_id = field.peek().clone();
+    let text = value.peek().trim().to_string();
+    if field_id.is_empty() || text.is_empty() {
+        return;
+    }
+    let rule = trace::ErrorRule {
+        field: field_id,
+        display: display.to_string(),
+        value: text,
+    };
+    if !current.contains(&rule) {
+        let mut next = current.to_vec();
+        next.push(rule);
+        on_change.call(next);
+    }
+    value.set(String::new());
+}
 
 #[derive(Props, Clone, PartialEq)]
 struct ContainerListProps {
@@ -764,12 +1111,14 @@ mod tests {
 }
 
 async fn scan_account(endpoint: &str) -> Result<Vec<cosmos::ContainerSchema>, String> {
-    let databases = cosmos::list_databases(endpoint).await?;
+    // One client for the whole scan — see `cosmos::connect`.
+    let client = cosmos::connect(endpoint).await?;
+    let databases = cosmos::list_databases(&client).await?;
     let mut out = Vec::new();
     for db in databases {
-        let containers = cosmos::list_containers(endpoint, &db).await?;
+        let containers = cosmos::list_containers(&client, &db).await?;
         for container in containers {
-            let schema = cosmos::infer_container_schema(endpoint, &db, &container).await?;
+            let schema = cosmos::infer_container_schema(&client, &db, &container).await?;
             out.push(schema);
         }
     }

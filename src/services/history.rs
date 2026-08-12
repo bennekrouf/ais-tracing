@@ -6,6 +6,7 @@
 //! an error worth interrupting a trace for.
 
 use crate::services::az::CosmosAccount;
+use crate::services::trace::ErrorRule;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -33,6 +34,11 @@ struct Store {
     /// Most recently opened first.
     #[serde(default)]
     recent_accounts: Vec<CosmosAccount>,
+    /// What counts as a failed step, keyed by account endpoint. This is
+    /// domain knowledge the user taught the app, so it must outlive the
+    /// session that taught it.
+    #[serde(default)]
+    error_rules: BTreeMap<String, Vec<ErrorRule>>,
 }
 
 fn path() -> PathBuf {
@@ -108,6 +114,25 @@ pub fn forget_account(endpoint: &str) -> Vec<CosmosAccount> {
     let updated = store.recent_accounts.clone();
     write(&store);
     updated
+}
+
+// ── Error rules ───────────────────────────────────────────────────────────
+
+pub fn load_rules(account: &str) -> Vec<ErrorRule> {
+    read().error_rules.remove(account).unwrap_or_default()
+}
+
+/// Replaces the whole set — the caller owns the list and edits it in place.
+pub fn save_rules(account: &str, rules: &[ErrorRule]) {
+    let mut store = read();
+    if rules.is_empty() {
+        store.error_rules.remove(account);
+    } else {
+        store
+            .error_rules
+            .insert(account.to_string(), rules.to_vec());
+    }
+    write(&store);
 }
 
 /// Deduped by endpoint rather than name: two subscriptions can hold accounts

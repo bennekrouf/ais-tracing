@@ -242,13 +242,18 @@ body {
 
 .btn-back {
     font-family: inherit;
-    font-size: 12px;
-    padding: 5px 12px;
-    border-radius: 6px;
+    font-size: 13px;
+    padding: 4px 10px;
+    border-radius: 5px;
     border: 1px solid var(--border);
     cursor: pointer;
     background: var(--bg2);
     color: var(--text2);
+    transition: color 0.15s, border-color 0.15s;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    flex-shrink: 0;
 }
 .btn-back:hover { color: var(--text1); border-color: var(--text2); }
 
@@ -291,6 +296,17 @@ body {
     max-width: 320px;
 }
 .spacer { flex: 1; min-width: 0; }
+
+/* Provenance of what's on screen: cached, refreshing, or freshly sampled. */
+.scan-state {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 10px;
+    color: var(--text3);
+    white-space: nowrap;
+}
+.scan-state.stale { color: var(--yellow); cursor: help; }
 
 /* Segmented icon tabs, same convention as ais-monitor: the glyph carries the
    meaning and `title` carries the name. */
@@ -444,6 +460,7 @@ table.schema-table tr:hover td { background: var(--bg2); }
 }
 .chip.ok    { color: var(--green); background: rgba(63,185,80,0.12); }
 .chip.warn  { color: var(--yellow); background: rgba(210,153,34,0.12); }
+.chip.bad   { color: var(--red); background: rgba(248,81,73,0.14); }
 .chip.muted { color: var(--text3); background: var(--bg2); }
 .evidence .chip { font-weight: 500; letter-spacing: 0; text-transform: none; }
 
@@ -590,12 +607,137 @@ table.schema-table tr:hover td { background: var(--bg2); }
 .block-fact .fact-name { color: var(--text3); }
 .block-fact .fact-value { color: var(--text2); text-overflow: ellipsis; overflow: hidden; }
 
+/* ── Error rules ──────────────────────────────────────────────────── */
+.rule-list { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 12px; }
+.rule-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    padding: 3px 4px 3px 10px;
+    border-radius: 10px;
+    border: 1px solid var(--red);
+    background: rgba(248,81,73,0.10);
+    color: var(--red);
+    white-space: nowrap;
+}
+.rule-drop {
+    font-family: inherit;
+    font-size: 10px;
+    line-height: 1;
+    padding: 2px 4px;
+    border: none;
+    border-radius: 8px;
+    background: none;
+    color: var(--red);
+    cursor: pointer;
+    opacity: 0.65;
+}
+.rule-drop:hover { opacity: 1; background: rgba(248,81,73,0.18); }
+
+.rule-form {
+    display: flex;
+    align-items: flex-end;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+.rule-form .az-field { flex: 1; min-width: 200px; }
+.rule-form input {
+    font-family: inherit;
+    font-size: 13px;
+    padding: 8px 12px;
+    background: var(--bg0);
+    color: var(--text1);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    width: 100%;
+}
+.rule-form input:focus { outline: none; border-color: var(--blue); }
+/* Narrower and quieter than the value box — it filters the list below rather
+   than being part of the rule. */
+.rule-form .field-filter {
+    font-size: 11px;
+    padding: 4px 9px;
+    background: var(--bg1);
+    margin-bottom: 4px;
+}
+.rule-form .az-field > .meta { margin-top: 3px; font-size: 10px; color: var(--text3); }
+
+/* Results are always on screen, so typing in the filter visibly narrows them.
+   Capped height keeps a hundred fields from pushing the form off the page. */
+.field-list {
+    max-height: 168px;
+    overflow-y: auto;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg0);
+    display: flex;
+    flex-direction: column;
+}
+.field-option {
+    font-family: inherit;
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+    text-align: left;
+    padding: 5px 10px;
+    border: none;
+    border-bottom: 1px solid var(--border2);
+    background: none;
+    cursor: pointer;
+}
+.field-option:last-child { border-bottom: none; }
+.field-option:hover { background: var(--bg2); }
+.field-option.on { background: var(--blue-bg); }
+.field-option.on .field-option-name,
+.field-option.on .field-option-note { color: #fff; }
+.field-option-name { font-size: 12px; color: var(--text1); }
+.field-option-note { font-size: 10px; color: var(--text3); white-space: nowrap; }
+.field-empty { padding: 8px 10px; font-size: 11px; color: var(--text3); font-style: italic; }
+
+.rule-observed {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 10px;
+}
+.value-chip {
+    font-family: inherit;
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: var(--bg2);
+    color: var(--text2);
+    cursor: pointer;
+    white-space: nowrap;
+}
+.value-chip:hover { color: var(--blue); border-color: var(--blue); }
+
 .block { cursor: pointer; transition: border-color 0.12s, background 0.12s; }
 .block:hover { background: var(--bg3); border-color: var(--text3); }
 .block.selected {
     background: var(--bg3);
     border-color: var(--blue);
     border-left-color: var(--blue);
+    box-shadow: 0 0 0 1px var(--blue);
+}
+
+/* A failed step. The left accent carries the signal even when the card is
+   clipped at the edge of the scroll track. */
+.block.errored {
+    background: rgba(248,81,73,0.10);
+    border-color: var(--red);
+    border-left-color: var(--red);
+}
+.block.errored:hover { background: rgba(248,81,73,0.16); }
+.block.errored .block-label { color: var(--red); }
+/* Selection still has to win — you must be able to tell which red card is open. */
+.block.errored.selected {
+    background: rgba(248,81,73,0.16);
+    border-color: var(--blue);
     box-shadow: 0 0 0 1px var(--blue);
 }
 

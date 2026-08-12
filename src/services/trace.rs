@@ -16,6 +16,7 @@ use crate::services::cosmos;
 use crate::services::discover::KeyCandidate;
 use azure_data_cosmos::Query;
 use chrono::{DateTime, NaiveDateTime, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -36,6 +37,45 @@ pub struct TraceSpec {
     pub label_field: String,
     /// Fields worth showing on a card, best first.
     pub fact_fields: Vec<String>,
+}
+
+/// A field value that means "this step failed".
+///
+/// What counts as an error is domain knowledge the data doesn't carry —
+/// `sessionStatus: 3` means nothing without someone saying so. Rules are
+/// therefore user-supplied and persisted per account, never guessed.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ErrorRule {
+    /// Lowercased dotted field path — what matching uses.
+    pub field: String,
+    /// The field's original spelling. Matching is case-insensitive, but the
+    /// UI shows fields as the documents spell them everywhere else.
+    #[serde(default)]
+    pub display: String,
+    /// Compared against the document's value as text, case-insensitively.
+    pub value: String,
+}
+
+impl ErrorRule {
+    /// `sessionStatus = 3`, for display.
+    pub fn label(&self) -> String {
+        let name = if self.display.is_empty() {
+            leaf(&self.field)
+        } else {
+            self.display.clone()
+        };
+        format!("{name} = {}", self.value)
+    }
+}
+
+/// Whether any rule matches — rules are OR'd, so several values of the same
+/// field (or several fields) can all mean failure.
+pub fn is_error(doc: &Value, rules: &[ErrorRule]) -> bool {
+    rules.iter().any(|rule| {
+        lookup(doc, &rule.field)
+            .and_then(scalar_text)
+            .is_some_and(|actual| actual.eq_ignore_ascii_case(&rule.value))
+    })
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -127,6 +167,30 @@ impl Trace {
 pub async fn run(endpoint: &str, containers: &[String], spec: &TraceSpec) -> Trace {
     let mut lanes = Vec::new();
 
+    // One client for every container — rebuilding it per query re-resolved
+    // credentials each time and dominated the wait.
+    let client = match cosmos::connect(endpoint).await {
+        Ok(client) => client,
+        Err(e) => {
+            return Trace {
+                value: spec.value.clone(),
+                key_label: spec.key.label.clone(),
+                blocks_found: 0,
+                span: None,
+                lanes: containers
+                    .iter()
+                    .map(|path| Lane {
+                        name: path.clone(),
+                        detail: None,
+                        blocks: Vec::new(),
+                        state: LaneState::Failed(0),
+                        error: Some(e.clone()),
+                    })
+                    .collect(),
+            }
+        }
+    };
+
     for path in containers {
         let Some((database, container)) = path.split_once('/') else {
             continue;
@@ -143,7 +207,7 @@ pub async fn run(endpoint: &str, containers: &[String], spec: &TraceSpec) -> Tra
         };
 
         let query = build_query(&binding.field, &spec.value);
-        match cosmos::query_documents(endpoint, database, container, query, MAX_BLOCKS).await {
+        match cosmos::query_documents(&client, database, container, query, MAX_BLOCKS).await {
             Ok(docs) => {
                 let mut blocks: Vec<Block> = docs
                     .iter()
@@ -797,6 +861,85 @@ mod tests {
         trace.lanes.iter().map(|l| l.name.as_str()).collect()
     }
 
+    /// Mirrors a real account: three containers carrying the key, one off the
+    /// path, and a `schema` field present in only some of the documents.
+    #[test]
+    fn a_real_shaped_account_regroups_onto_its_schema_field() {
+        // `schema`, not the `workflowName` the other tests use — the point is
+        // that the axis follows whatever field was chosen.
+        let schema_block = |id: &str, container: &str, schema: Option<&str>, at: i64| Block {
+            id: id.into(),
+            label: "step".into(),
+            at: Some(at),
+            at_text: String::new(),
+            facts: vec![],
+            container: container.into(),
+            doc: match schema {
+                Some(s) => json!({ "correlationId": "c50f1a6a", "schema": s }),
+                None => json!({ "correlationId": "c50f1a6a" }),
+            },
+        };
+
+        let base = Trace {
+            value: "c50f1a6a".into(),
+            key_label: "correlationId".into(),
+            blocks_found: 4,
+            span: Some((0, 11_000)),
+            lanes: vec![
+                // Sessions documents have no `schema` field at all.
+                container_lane(
+                    "ais/Sessions",
+                    vec![schema_block("1", "ais/Sessions", None, 0)],
+                ),
+                container_lane(
+                    "ais/MsgItems",
+                    vec![
+                        schema_block("2", "ais/MsgItems", Some("ais.pivot.event"), 11_000),
+                        schema_block("3", "ais/MsgItems", Some("ais.jde.invoice"), 11_000),
+                    ],
+                ),
+                container_lane(
+                    "ais/MsgTracking",
+                    vec![schema_block("4", "ais/MsgTracking", Some("ais.pivot.event"), 11_000)],
+                ),
+                Lane {
+                    name: "ais/leases".into(),
+                    detail: None,
+                    blocks: vec![],
+                    state: LaneState::OffPath,
+                    error: None,
+                },
+            ],
+        };
+
+        let out = relane(&base, "schema", &[]);
+        let mut got = names(&out);
+        got.sort_unstable();
+        assert_eq!(got, vec!["(no schema)", "ais.jde.invoice", "ais.pivot.event"]);
+
+        // The same schema value seen in two containers becomes one lane.
+        let pivot = out.lanes.iter().find(|l| l.name == "ais.pivot.event").unwrap();
+        assert_eq!(pivot.blocks.len(), 2);
+        assert_eq!(
+            pivot.detail.as_deref(),
+            Some("ais/MsgItems, ais/MsgTracking")
+        );
+
+        // No container name survives as a lane.
+        assert!(!names(&out).iter().any(|n| n.starts_with("ais/")));
+    }
+
+    /// The label field is read the same way, so a working `schema` label
+    /// proves `schema` is also usable as the axis.
+    #[test]
+    fn the_lane_field_is_looked_up_exactly_like_the_label_field() {
+        let doc = json!({ "correlationId": "abc", "schema": "ais.pivot.event" });
+        assert_eq!(
+            lookup(&doc, "schema").and_then(scalar_text),
+            Some("ais.pivot.event".into())
+        );
+    }
+
     /// Containers that never carry the key are a statement about containers.
     /// Once lanes are stages, that statement has nowhere to live.
     #[test]
@@ -818,6 +961,44 @@ mod tests {
         let out = regroup(lanes, "workflowname", &[]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, "Validate");
+    }
+
+    #[test]
+    fn error_rules_match_numbers_typed_as_text() {
+        // The user types "3"; Cosmos stored the number 3.
+        let doc = json!({ "sessionStatus": 3, "state": "Failed" });
+        let rule = |f: &str, v: &str| ErrorRule {
+            field: f.into(),
+            display: f.into(),
+            value: v.into(),
+        };
+
+        assert!(is_error(&doc, &[rule("sessionstatus", "3")]));
+        assert!(!is_error(&doc, &[rule("sessionstatus", "2")]));
+        // Substrings must not match — status 3 is not status 30.
+        assert!(!is_error(&doc, &[rule("sessionstatus", "30")]));
+        assert!(is_error(&doc, &[rule("state", "failed")]));
+        assert!(!is_error(&doc, &[rule("missing", "3")]));
+        assert!(!is_error(&doc, &[]));
+    }
+
+    #[test]
+    fn error_rules_are_ord_and_read_nested_paths() {
+        let doc = json!({ "properties": { "sessionStatus": 3 } });
+        let rules = vec![
+            ErrorRule {
+                field: "state".into(),
+                display: "state".into(),
+                value: "Failed".into(),
+            },
+            ErrorRule {
+                field: "properties.sessionstatus".into(),
+                display: "sessionStatus".into(),
+                value: "3".into(),
+            },
+        ];
+        assert!(is_error(&doc, &rules));
+        assert_eq!(rules[1].label(), "sessionStatus = 3");
     }
 
     #[test]

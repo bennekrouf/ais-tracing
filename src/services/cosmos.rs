@@ -16,6 +16,7 @@ use azure_data_cosmos::{
 };
 use azure_identity::DeveloperToolsCredential;
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
@@ -30,7 +31,7 @@ const MAX_DEPTH: usize = 3;
 const VALUE_CAP: usize = 256;
 
 /// A field observed across the sampled documents of a container.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FieldInfo {
     /// Dotted path — `correlationId`, or `properties.correlationId` when nested.
     pub name: String,
@@ -69,7 +70,7 @@ impl FieldInfo {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ContainerSchema {
     pub database: String,
     pub container: String,
@@ -84,7 +85,13 @@ impl ContainerSchema {
 
 }
 
-async fn client_for(endpoint: &str) -> Result<CosmosClient, String> {
+/// Builds one client for a whole run of work.
+///
+/// This resolves credentials (which can shell out to `az`) and negotiates the
+/// account's regions, so it is far too expensive to do per query — building it
+/// once and threading it through is the difference between a scan that stalls
+/// the window and one that doesn't.
+pub async fn connect(endpoint: &str) -> Result<CosmosClient, String> {
     let credential = DeveloperToolsCredential::new(None)
         .map_err(|e| format!("failed to build credential: {e}"))?;
     let account_endpoint: AccountEndpoint = endpoint
@@ -98,8 +105,7 @@ async fn client_for(endpoint: &str) -> Result<CosmosClient, String> {
         .map_err(|e| format!("failed to build Cosmos client: {e}"))
 }
 
-pub async fn list_databases(endpoint: &str) -> Result<Vec<String>, String> {
-    let client = client_for(endpoint).await?;
+pub async fn list_databases(client: &CosmosClient) -> Result<Vec<String>, String> {
     let mut items = client
         .query_databases("SELECT * FROM dbs", None)
         .await
@@ -114,8 +120,10 @@ pub async fn list_databases(endpoint: &str) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-pub async fn list_containers(endpoint: &str, database: &str) -> Result<Vec<String>, String> {
-    let client = client_for(endpoint).await?;
+pub async fn list_containers(
+    client: &CosmosClient,
+    database: &str,
+) -> Result<Vec<String>, String> {
     let db = client.database_client(database);
     let mut items = db
         .query_containers("SELECT * FROM c", None)
@@ -132,13 +140,12 @@ pub async fn list_containers(endpoint: &str, database: &str) -> Result<Vec<Strin
 /// Runs an arbitrary query against one container, returning at most `limit`
 /// documents. Used by `trace.rs` to pull the documents carrying one key value.
 pub async fn query_documents(
-    endpoint: &str,
+    client: &CosmosClient,
     database: &str,
     container: &str,
     query: Query,
     limit: usize,
 ) -> Result<Vec<Value>, String> {
-    let client = client_for(endpoint).await?;
     let container_client = client
         .database_client(database)
         .container_client(container)
@@ -165,11 +172,10 @@ pub async fn query_documents(
 /// Samples up to `SAMPLE_SIZE` documents from a container and records the
 /// field paths present, the types observed, and the scalar values seen.
 pub async fn infer_container_schema(
-    endpoint: &str,
+    client: &CosmosClient,
     database: &str,
     container: &str,
 ) -> Result<ContainerSchema, String> {
-    let client = client_for(endpoint).await?;
     let container_client = client
         .database_client(database)
         .container_client(container)
