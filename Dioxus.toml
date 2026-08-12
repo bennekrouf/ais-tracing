@@ -1,0 +1,12 @@
+[application]
+name = "ais-tracing"
+default_platform = "desktop"
+
+[desktop]
+title = "AIS Tracing"
+
+[bundle]
+identifier = "com.ais-tracing.app"
+
+[web.app]
+title = "AIS Tracing"

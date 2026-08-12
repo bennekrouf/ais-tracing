@@ -1,0 +1,520 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g. 0.2.0) — empty = auto-bump patch'
+        required: false
+        default: ''
+      bump:
+        description: 'Bump type if version is empty'
+        required: false
+        default: 'patch'
+        type: choice
+        options: [patch, minor, major]
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.bump.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Bump version and tag
+        id: bump
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+          BUMP_TYPE: ${{ inputs.bump }}
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: github-actions[bot]@users.noreply.github.com
+        run: |
+          CURRENT=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+
+          if [[ -n "$VERSION_INPUT" ]]; then
+            NEW="$VERSION_INPUT"
+          elif [[ "$BUMP_TYPE" == "major" ]]; then
+            NEW="$((MAJOR+1)).0.0"
+          elif [[ "$BUMP_TYPE" == "minor" ]]; then
+            NEW="$MAJOR.$((MINOR+1)).0"
+          else
+            NEW="$MAJOR.$MINOR.$((PATCH+1))"
+          fi
+
+          TAG="v$NEW"
+          sed -i "s/^version = \"$CURRENT\"/version = \"$NEW\"/" Cargo.toml
+          git add Cargo.toml
+          git commit -m "chore: release $TAG"
+          git tag "$TAG"
+          git push origin HEAD
+          git push origin "$TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  build-mac:
+    needs: [prepare]
+    if: always() && !failure() && !cancelled()
+    runs-on: macos-latest
+    env:
+      SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+      APP_STORE_KEY:        ${{ secrets.APP_STORE_CONNECT_KEY }}
+      APP_STORE_KEY_ID:     ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+      APP_STORE_ISSUER_ID:  ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-macos-arm64-cargo-${{ hashFiles('Cargo.lock') }}
+
+      # ── Sanity-check required signing secrets up front ─────────────────────
+      - name: Verify macOS signing secrets are present
+        env:
+          MACOS_CERTIFICATE:     ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          KEYCHAIN_PASSWORD:     ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          missing=()
+          [ -z "${SIGNING_IDENTITY:-}"      ] && missing+=("MACOS_SIGNING_IDENTITY")
+          [ -z "${APP_STORE_KEY:-}"        ] && missing+=("APP_STORE_CONNECT_KEY")
+          [ -z "${APP_STORE_KEY_ID:-}"     ] && missing+=("APP_STORE_CONNECT_KEY_ID")
+          [ -z "${APP_STORE_ISSUER_ID:-}"  ] && missing+=("APP_STORE_CONNECT_ISSUER_ID")
+          [ -z "${MACOS_CERTIFICATE:-}"     ] && missing+=("MACOS_CERTIFICATE")
+          [ -z "${MACOS_CERTIFICATE_PWD:-}" ] && missing+=("MACOS_CERTIFICATE_PWD")
+          [ -z "${KEYCHAIN_PASSWORD:-}"     ] && missing+=("KEYCHAIN_PASSWORD")
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing GitHub Actions secrets: ${missing[*]}"
+            echo "Add them in: Settings → Secrets and variables → Actions"
+            exit 1
+          fi
+          echo "All 7 macOS signing secrets present."
+
+      # ── Import Developer ID cert into a temporary keychain ─────────────────
+      - name: Set up signing keychain
+        env:
+          MACOS_CERTIFICATE:     ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          KEYCHAIN_PASSWORD:     ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+
+          echo "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+
+          security create-keychain  -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$RUNNER_TEMP/cert.p12" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$MACOS_CERTIFICATE_PWD" \
+            -T /usr/bin/codesign
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          rm "$RUNNER_TEMP/cert.p12"
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: cargo build --release --target aarch64-apple-darwin
+
+      # ── Sign the binary with hardened runtime + webview entitlements ───────
+      - name: Codesign binary
+        run: |
+          set -euo pipefail
+          BIN=target/aarch64-apple-darwin/release/ais-tracing
+          codesign --force --options runtime --timestamp \
+            --entitlements .github/macos-entitlements.plist \
+            --sign "$SIGNING_IDENTITY" \
+            "$BIN"
+          codesign --verify --strict --verbose=2 "$BIN"
+
+      # ── Generate icon.icns from assets/icon.png (1024x1024 source) ─────────
+      # No-op if the PNG is absent; bundle just ships icon-less in that case.
+      - name: Generate macOS .icns
+        run: |
+          set -euo pipefail
+          if [ ! -f assets/icon.png ]; then
+            echo "::warning::assets/icon.png not found — .app will ship without an icon."
+            exit 0
+          fi
+          ICONSET="$RUNNER_TEMP/icon.iconset"
+          mkdir -p "$ICONSET"
+          for size in 16 32 64 128 256 512 1024; do
+            sips -z $size $size assets/icon.png --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
+          done
+          # Retina (@2x) variants — Apple expects these for crisp scaling.
+          cp "$ICONSET/icon_32x32.png"     "$ICONSET/icon_16x16@2x.png"
+          cp "$ICONSET/icon_64x64.png"     "$ICONSET/icon_32x32@2x.png"
+          cp "$ICONSET/icon_256x256.png"   "$ICONSET/icon_128x128@2x.png"
+          cp "$ICONSET/icon_512x512.png"   "$ICONSET/icon_256x256@2x.png"
+          cp "$ICONSET/icon_1024x1024.png" "$ICONSET/icon_512x512@2x.png"
+          rm "$ICONSET/icon_64x64.png" "$ICONSET/icon_1024x1024.png"
+          mkdir -p dist
+          iconutil -c icns "$ICONSET" -o dist/icon.icns
+
+      # ── Wrap binary in .app bundle, build signed + notarized + stapled DMG ─
+      - name: Build .app + .dmg
+        run: |
+          set -euo pipefail
+          BIN=target/aarch64-apple-darwin/release/ais-tracing
+          VER="${GITHUB_REF_NAME#v}"
+          APP="dist/AIS Tracing.app"
+
+          # 1. Construct the .app bundle around the cargo-built binary.
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp "$BIN" "$APP/Contents/MacOS/ais-tracing"
+          chmod +x "$APP/Contents/MacOS/ais-tracing"
+
+          ICON_KEY=""
+          if [ -f dist/icon.icns ]; then
+            cp dist/icon.icns "$APP/Contents/Resources/icon.icns"
+            ICON_KEY="<key>CFBundleIconFile</key><string>icon</string>"
+          fi
+
+          cat > "$APP/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleExecutable</key><string>ais-tracing</string>
+            <key>CFBundleIdentifier</key><string>com.ais-tracing.app</string>
+            <key>CFBundleName</key><string>AIS Tracing</string>
+            <key>CFBundleDisplayName</key><string>AIS Tracing</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>$VER</string>
+            <key>CFBundleVersion</key><string>$VER</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+            $ICON_KEY
+          </dict></plist>
+          EOF
+
+          # 2. Re-sign the .app (sign nested binary first via --deep).
+          codesign --force --options runtime --timestamp \
+            --entitlements .github/macos-entitlements.plist \
+            --sign "$SIGNING_IDENTITY" \
+            --deep "$APP"
+          codesign --verify --strict --verbose=2 "$APP"
+
+          # 3. Stage and create .dmg.
+          mkdir -p dmg-staging
+          cp -R "$APP" dmg-staging/
+          ln -s /Applications dmg-staging/Applications
+          hdiutil create -volname "AIS Tracing" -srcfolder dmg-staging \
+            -ov -format UDZO dist/ais-tracing-macos-arm64.dmg
+          codesign --force --timestamp --sign "$SIGNING_IDENTITY" \
+            dist/ais-tracing-macos-arm64.dmg
+
+          # 4. Notarize the DMG (covers the binary inside via hash) and staple.
+          P8="$RUNNER_TEMP/AuthKey_${APP_STORE_KEY_ID}.p8"
+          echo "$APP_STORE_KEY" | base64 --decode > "$P8"
+
+          xcrun notarytool submit dist/ais-tracing-macos-arm64.dmg \
+            --key "$P8" \
+            --key-id "$APP_STORE_KEY_ID" \
+            --issuer "$APP_STORE_ISSUER_ID" \
+            --wait
+          xcrun stapler staple dist/ais-tracing-macos-arm64.dmg
+          xcrun stapler validate dist/ais-tracing-macos-arm64.dmg
+
+          shasum -a 256 dist/ais-tracing-macos-arm64.dmg \
+            > dist/ais-tracing-macos-arm64.dmg.sha256
+
+      - name: Clean up keychain
+        if: always()
+        run: |
+          security delete-keychain "$KEYCHAIN_PATH" || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ais-tracing-macos-arm64
+          path: |
+            dist/ais-tracing-macos-arm64.dmg
+            dist/ais-tracing-macos-arm64.dmg.sha256
+
+  build-windows:
+    needs: [prepare]
+    if: always() && !failure() && !cancelled()
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-windows-cargo-${{ hashFiles('Cargo.lock') }}
+
+      # ── Generate assets/icon.ico from assets/icon.png (ImageMagick is
+      # preinstalled on windows-latest as `magick`). No-op if PNG missing;
+      # build.rs already handles that case with a cargo:warning.
+      - name: Generate Windows .ico
+        shell: pwsh
+        run: |
+          if (Test-Path assets/icon.png) {
+            magick assets/icon.png -define icon:auto-resize=16,24,32,48,64,128,256 assets/icon.ico
+          } else {
+            Write-Host "::warning::assets/icon.png not found — .exe will ship without an embedded icon."
+          }
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Copy WebView2Loader.dll
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem "target\release\build\webview2-com-sys-*\out\x64\WebView2Loader.dll" | Select-Object -First 1
+          if ($dll) { Copy-Item $dll.FullName "target\release\WebView2Loader.dll" -Force }
+          else { Write-Error "WebView2Loader.dll not found in build output" }
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = @(
+            "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+            "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) { Write-Error "ISCC.exe not found" }
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          & $iscc /DMyAppVersion=$version installer\installer.iss
+          # Inno emits a versionless filename so the "/releases/latest/download/"
+          # URL is stable across releases. Version info still lives inside the .exe
+          # (properties + wizard) and in the app's own title bar.
+          $exe = "ais-tracing-setup.exe"
+          $hash = (Get-FileHash "dist\$exe" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $exe" | Out-File "dist\$exe.sha256" -Encoding ASCII
+          Write-Host "Installer: dist\$exe ($([math]::Round((Get-Item dist\$exe).Length/1MB,1)) MB)"
+
+      # ── SignPath Foundation: code-sign the .exe for free (OSS only) ────────
+      # Uncomment this block after SignPath Foundation has approved the project.
+      # Until then the .exe ships unsigned (SmartScreen will warn on download).
+      #
+      # Setup (one-time, after SignPath approval):
+      #   1. Add repo secret `SIGNPATH_API_TOKEN` (from SignPath dashboard).
+      #   2. Fill the three placeholders below with values from your
+      #      SignPath project page (organization-id, project-slug, policy-slug).
+      #
+      # - name: Upload unsigned artifact to GitHub
+      #   id: upload-unsigned
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: ais-tracing-windows-unsigned
+      #     path: dist/ais-tracing-setup.exe
+      #
+      # - name: Submit signing request to SignPath
+      #   uses: signpath/github-action-submit-signing-request@v1
+      #   with:
+      #     api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+      #     organization-id: 'REPLACE-WITH-SIGNPATH-ORG-UUID'
+      #     project-slug:    'REPLACE-WITH-SIGNPATH-PROJECT-SLUG'
+      #     signing-policy-slug: 'REPLACE-WITH-SIGNPATH-POLICY-SLUG'
+      #     github-artifact-id: ${{ steps.upload-unsigned.outputs.artifact-id }}
+      #     wait-for-completion: true
+      #     output-artifact-directory: dist-signed
+      #
+      # - name: Replace .exe with the signed version
+      #   shell: pwsh
+      #   run: |
+      #     Move-Item -Force dist-signed\ais-tracing-setup.exe dist\ais-tracing-setup.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ais-tracing-windows
+          path: |
+            dist\ais-tracing-setup.exe
+            dist\ais-tracing-setup.exe.sha256
+
+  build-linux:
+    needs: [prepare]
+    if: always() && !failure() && !cancelled()
+    runs-on: ubuntu-latest
+
+    # x86_64 only — cross-compiling GTK/WebKit for ARM64 Linux requires a full
+    # ARM64 sysroot which is impractical on ubuntu-latest runners.
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-linux-x86_64-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            pkg-config
+
+      - name: Build
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+
+      - name: Package tar.gz
+        run: |
+          NAME="ais-tracing-linux-x86_64"
+          DIST="dist/$NAME"
+          mkdir -p "$DIST"
+          cp target/x86_64-unknown-linux-gnu/release/ais-tracing "$DIST/"
+          cp scripts/setup-linux.sh "$DIST/"
+          chmod +x "$DIST/setup-linux.sh"
+          # Bundle the icon so setup-linux.sh can register it with the
+          # hicolor theme and the .desktop entry shows branding instead
+          # of the generic terminal glyph. No-op if PNG is missing.
+          if [ -f assets/icon.png ]; then
+            cp assets/icon.png "$DIST/icon.png"
+          else
+            echo "::warning::assets/icon.png not found — Linux tarball will ship without an icon."
+          fi
+          tar -czf "$NAME.tar.gz" -C dist "$NAME"
+          sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ais-tracing-linux-x86_64
+          path: |
+            ais-tracing-linux-x86_64.tar.gz
+            ais-tracing-linux-x86_64.tar.gz.sha256
+
+  release:
+    needs: [build-mac, build-windows, build-linux]
+    # Mirror the build jobs: skipped `prepare` (the tag-push path doesn't run
+    # it) propagates through the default `if: success()` and would skip
+    # `release` too. Override so we only skip on genuine failure / cancel.
+    if: always() && !failure() && !cancelled()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts + generate latest.json
+        env:
+          REPO: ${{ github.repository }}
+          TAG:  ${{ github.ref_name }}
+        run: |
+          mkdir -p release
+          find artifacts -type f -exec cp {} release/ \;
+          ls -lh release/
+
+          VER="${TAG#v}"
+          BASE="https://github.com/$REPO/releases/download/$TAG"
+          MAC_DMG="ais-tracing-macos-arm64.dmg"
+          WIN_EXE="ais-tracing-setup.exe"
+          LINUX_TGZ="ais-tracing-linux-x86_64.tar.gz"
+
+          sha() { [ -n "$1" ] && [ -f "release/$1" ] && sha256sum "release/$1" | awk '{print $1}' || echo ""; }
+
+          cat > release/latest.json <<EOF
+          {
+            "name": "ais-tracing",
+            "version": "$VER",
+            "tag": "$TAG",
+            "released_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "platforms": {
+              "macos":   { "dmg":    { "url": "$BASE/$MAC_DMG",   "sha256": "$(sha "$MAC_DMG")"   } },
+              "windows": { "exe_or_msi": { "url": "$BASE/$WIN_EXE", "sha256": "$(sha "$WIN_EXE")" } },
+              "linux":   { "tarball": { "url": "$BASE/$LINUX_TGZ", "sha256": "$(sha "$LINUX_TGZ")" } }
+            }
+          }
+          EOF
+          cp release/latest.json artifacts/  # so gh release attaches it
+          cat release/latest.json
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.ref_name }}"
+          FILES=$(find artifacts -type f | tr '\n' ' ')
+
+          # `--latest` forces this release to be flagged "Latest" in the GitHub
+          # UI and via the `/releases/latest` API. Without it, the repo's
+          # "latest release preference" (which may be set to manually-pinned)
+          # decides — and an old stray release can hang on as latest.
+          gh release create "$TAG" \
+            --latest \
+            --title "ais-tracing $TAG" \
+            --notes "$(cat <<'EOF'
+          ## Desktop app
+
+          ### macOS (Apple Silicon)
+          Download `ais-tracing-macos-arm64.dmg`, open it, and drag AIS Tracing to /Applications.
+          Signed with Apple Developer ID and notarized — opens with a normal double-click.
+
+          ### Windows
+          Download `ais-tracing-setup.exe` from this release and run it. The same
+          URL also serves the latest version directly:
+          `https://github.com/${{ github.repository }}/releases/latest/download/ais-tracing-setup.exe`
+
+          ### Linux (x86_64)
+          ```bash
+          curl -L https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/ais-tracing-linux-x86_64.tar.gz | tar xz
+          cd ais-tracing-linux-x86_64
+          sudo ./setup-linux.sh && ./ais-tracing
+          ```
+
+          ## First run
+
+          ais-tracing reads your existing Azure CLI session — no separate sign-in:
+
+          ```
+          az login
+          ```
+
+          Then pick a Cosmos DB account, and it samples every container to work out
+          which field correlates a flow.
+          EOF
+          )" \
+            $FILES
