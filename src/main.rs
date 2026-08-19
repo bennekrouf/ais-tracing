@@ -59,8 +59,11 @@ fn App() -> Element {
                 }
             },
             Some(acc) => rsx! {
+                // The theme signal is owned here so it also covers Welcome;
+                // Home only needs it to render the toggle.
                 Home {
                     account: acc,
+                    is_light: is_light,
                     on_back: move |_| account.set(None),
                 }
             },

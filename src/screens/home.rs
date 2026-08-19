@@ -22,12 +22,15 @@ enum LoadState {
 #[derive(Props, Clone, PartialEq)]
 pub struct HomeProps {
     pub account: CosmosAccount,
+    /// Owned by the root App so the theme also applies to Welcome.
+    pub is_light: Signal<bool>,
     pub on_back: EventHandler<()>,
 }
 
 #[component]
 pub fn Home(props: HomeProps) -> Element {
     let account = props.account.clone();
+    let mut is_light = props.is_light;
     // Tracing is the job; setup is the thing you do once. Land on the work.
     let mut tab = use_signal(|| Tab::Trace);
     let mut state = use_signal(|| LoadState::Idle);
@@ -138,6 +141,51 @@ pub fn Home(props: HomeProps) -> Element {
         tracing,
         selected: selected_block,
     };
+
+    // Type-ahead over correlation values. Each lookup is a cross-container
+    // scan, so it is debounced and only runs past a minimum length — firing
+    // one per keystroke would be genuinely expensive in RUs.
+    let mut typed = use_signal(String::new);
+    let mut suggestions = use_signal(Vec::<String>::new);
+    let mut suggesting = use_signal(|| false);
+    use_effect({
+        let endpoint = account.endpoint.clone();
+        move || {
+            let text = typed.read().trim().to_string();
+            if text.len() < trace::MIN_FRAGMENT {
+                suggestions.set(Vec::new());
+                suggesting.set(false);
+                return;
+            }
+            let Some(key) = insights
+                .peek()
+                .keys
+                .iter()
+                .find(|c| c.id == *key_id.peek())
+                .cloned()
+            else {
+                return;
+            };
+            let containers = insights.peek().containers.clone();
+            let endpoint = endpoint.clone();
+            suggesting.set(true);
+            spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+                // Superseded while waiting — drop it without querying.
+                if *typed.peek() != text {
+                    return;
+                }
+                let found = trace::suggest(&endpoint, &containers, &key, &text).await;
+                // And again on return: a slow query must not overwrite the
+                // results of a newer, faster one.
+                if *typed.peek() != text {
+                    return;
+                }
+                suggestions.set(found);
+                suggesting.set(false);
+            });
+        }
+    });
 
     // Land on something rather than an empty box: once the scan has settled on
     // a key, replay the value traced last. Guarded so it happens once per
@@ -252,6 +300,18 @@ pub fn Home(props: HomeProps) -> Element {
                 },
                 "↻ Rescan"
             }
+
+            // Far right, after Rescan. The glyph shows what you'd switch *to*,
+            // not what you're in.
+            button {
+                class: "btn-theme",
+                title: if *is_light.read() { "Switch to dark mode" } else { "Switch to light mode" },
+                onclick: move |_| {
+                    let next = !*is_light.peek();
+                    is_light.set(next);
+                },
+                if *is_light.read() { "🌙" } else { "☀️" }
+            }
         }
 
         div { class: "screen-split",
@@ -350,6 +410,9 @@ pub fn Home(props: HomeProps) -> Element {
                                     disabled: *tracing.read(),
                                     key_label: key.label.clone(),
                                     recent: recent.read().clone(),
+                                    suggestions: suggestions.read().clone(),
+                                    suggesting: *suggesting.read(),
+                                    on_typed: move |v: String| typed.set(v),
                                     on_clear: {
                                         let endpoint = account.endpoint.clone();
                                         move |_| recent.set(history::clear(&endpoint))
@@ -368,6 +431,10 @@ pub fn Home(props: HomeProps) -> Element {
                                     TraceView {
                                         trace: t,
                                         rules: rules.read().clone(),
+                                        on_pick_value: {
+                                            let endpoint = account.endpoint.clone();
+                                            move |v: String| follow.run(&endpoint, v)
+                                        },
                                         lane_id: lane_id.read().clone(),
                                         lane_options: lane_options.clone(),
                                         on_lane: move |v: String| lane_id.set(v),
@@ -625,6 +692,7 @@ fn DocPanel(props: DocPanelProps) -> Element {
         .unwrap_or_else(|e| format!("could not render document: {e}"));
     let lines = pretty.lines().count();
     let bytes = pretty.len();
+    let mut copied = use_signal(|| false);
 
     rsx! {
         aside { class: "doc-panel",
@@ -642,8 +710,34 @@ fn DocPanel(props: DocPanelProps) -> Element {
             if !props.block.at_text.is_empty() {
                 p { class: "meta", "{props.block.at_text}" }
             }
+            // The button is a sibling of the scroller, not inside it, so it
+            // stays pinned to the corner as the document scrolls.
             div { class: "doc-body",
                 pre { class: "doc-json", "{pretty}" }
+                button {
+                    class: if *copied.read() { "doc-copy done" } else { "doc-copy" },
+                    title: "Copy the document as JSON",
+                    onclick: {
+                        let pretty = pretty.clone();
+                        move |_| {
+                            // Best-effort: a clipboard we can't reach is not
+                            // worth interrupting the user over.
+                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                if clipboard.set_text(pretty.clone()).is_ok() {
+                                    copied.set(true);
+                                    spawn(async move {
+                                        tokio::time::sleep(
+                                            std::time::Duration::from_millis(1400),
+                                        )
+                                        .await;
+                                        copied.set(false);
+                                    });
+                                }
+                            }
+                        }
+                    },
+                    if *copied.read() { "copied" } else { "copy" }
+                }
             }
             p { class: "meta doc-foot", "{lines} lines · {bytes} bytes" }
         }
@@ -655,7 +749,11 @@ struct FollowValueProps {
     key_label: String,
     disabled: bool,
     recent: Vec<history::Entry>,
+    /// Correlation values containing what's been typed so far.
+    suggestions: Vec<String>,
+    suggesting: bool,
     on_follow: EventHandler<String>,
+    on_typed: EventHandler<String>,
     on_clear: EventHandler<()>,
 }
 
@@ -673,6 +771,12 @@ fn FollowValue(props: FollowValueProps) -> Element {
             .unwrap_or_default()
     });
     let ready = !value.read().trim().is_empty() && !props.disabled;
+    // Suppress the list once the box already holds one of its own suggestions
+    // — otherwise picking one leaves a dropdown offering the thing you picked.
+    let exact_already = props
+        .suggestions
+        .iter()
+        .any(|s| *s == *value.read().trim());
 
     let submit = move |_| {
         let v = value.read().trim().to_string();
@@ -688,9 +792,12 @@ fn FollowValue(props: FollowValueProps) -> Element {
                     label { "Follow one value of {props.key_label}" }
                     input {
                         r#type: "text",
-                        placeholder: "paste a value...",
+                        placeholder: "paste a value, or type part of one…",
                         value: "{value}",
-                        oninput: move |e| value.set(e.value()),
+                        oninput: move |e| {
+                            value.set(e.value());
+                            props.on_typed.call(e.value());
+                        },
                         onkeydown: move |e| {
                             if e.key() == Key::Enter && ready {
                                 let v = value.read().trim().to_string();
@@ -699,6 +806,29 @@ fn FollowValue(props: FollowValueProps) -> Element {
                                 }
                             }
                         },
+                    }
+
+                    // Only worth showing while the box holds a fragment: once
+                    // it holds a full id, the list is just the id again.
+                    if !exact_already && (props.suggesting || !props.suggestions.is_empty()) {
+                        div { class: "suggest-list",
+                            if props.suggesting && props.suggestions.is_empty() {
+                                div { class: "suggest-empty", "searching…" }
+                            }
+                            for s in props.suggestions.iter() {
+                                button {
+                                    class: "suggest-row",
+                                    onclick: {
+                                        let s = s.clone();
+                                        move |_| {
+                                            value.set(s.clone());
+                                            props.on_follow.call(s.clone());
+                                        }
+                                    },
+                                    "{s}"
+                                }
+                            }
+                        }
                     }
                 }
                 button {

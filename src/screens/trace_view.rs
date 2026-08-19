@@ -33,6 +33,8 @@ pub struct TraceViewProps {
     /// Fires with the clicked card's id; the parent decides whether that
     /// opens or closes the panel.
     pub on_select: EventHandler<String>,
+    /// Narrow an ambiguous fragment to one exact correlation value.
+    pub on_pick_value: EventHandler<String>,
 }
 
 #[component]
@@ -57,7 +59,17 @@ pub fn TraceView(props: TraceViewProps) -> Element {
     rsx! {
         div { class: "panel trace-panel",
             div { class: "panel-head",
-                h3 { "{trace.key_label} = {trace.value}" }
+                // On a fragment hit, show the value actually found rather than
+                // what was typed — they differ, and the real one is the answer.
+                h3 {
+                    match (trace.partial, trace.matches.as_slice()) {
+                        (true, [(found, _)]) => format!("{} = {found}", trace.key_label),
+                        _ => format!("{} = {}", trace.key_label, trace.value),
+                    }
+                }
+                if trace.partial {
+                    span { class: "chip warn", "matched “{trace.value}” as a fragment" }
+                }
                 span { class: "chip ok", "{trace.reached()} reached" }
                 if trace.awaiting() > 0 {
                     span { class: "chip warn", "{trace.awaiting()} awaiting" }
@@ -92,7 +104,28 @@ pub fn TraceView(props: TraceViewProps) -> Element {
 
             if trace.blocks_found == 0 {
                 div { class: "az-hint",
-                    "No document anywhere carries this value. Check the value, or the key."
+                    "No document anywhere carries this value, in full or in part. "
+                    "Check the value, or the key."
+                }
+            } else if trace.matches.len() > 1 {
+                // Drawing these together would silently interleave unrelated
+                // flows on one timeline, which is worse than asking.
+                div { class: "az-hint",
+                    "“{trace.value}” matches {trace.matches.len()} different "
+                    "{trace.key_label} values. Pick the one to follow."
+                }
+                div { class: "match-list",
+                    for (value, count) in trace.matches.iter() {
+                        button {
+                            class: "match-row",
+                            onclick: {
+                                let value = value.clone();
+                                move |_| props.on_pick_value.call(value.clone())
+                            },
+                            span { class: "match-value", "{value}" }
+                            span { class: "match-count", "{count} documents" }
+                        }
+                    }
                 }
             } else {
                 div { class: "trace-scroll",
@@ -283,6 +316,7 @@ mod tests {
             at_text: String::new(),
             facts: vec![],
             container: "db/c".into(),
+            key_value: "abc".into(),
             doc: serde_json::Value::Null,
         }
     }
@@ -306,6 +340,8 @@ mod tests {
             value: "abc".into(),
             key_label: "correlationId".into(),
             blocks_found: lanes.iter().map(|l| l.blocks.len()).sum(),
+            partial: false,
+            matches: vec![],
             span: times.iter().min().copied().zip(times.iter().max().copied()),
             lanes,
         }

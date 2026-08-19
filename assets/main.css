@@ -261,6 +261,18 @@ body {
 }
 .btn-back:hover { color: var(--text1); border-color: var(--text2); }
 
+.btn-theme {
+    font-size: 16px;
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    padding: 4px 8px;
+    border-radius: 4px;
+    transition: background 0.12s;
+    flex-shrink: 0;
+}
+.btn-theme:hover { background: var(--bg2); }
+
 /* ══════════════════════════════════════════════
    MAIN SCREEN (schema scan)
 ══════════════════════════════════════════════ */
@@ -487,6 +499,34 @@ table.schema-table tr:hover td { background: var(--bg2); }
 .follow-panel input:focus { outline: none; border-color: var(--blue); }
 .follow-panel .btn-primary { font-size: 13px; padding: 9px 20px; }
 
+/* Type-ahead over correlation values. Sits directly under the input so the
+   results appear where you're already looking. */
+.suggest-list {
+    margin-top: 4px;
+    max-height: 190px;
+    overflow-y: auto;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg0);
+    display: flex;
+    flex-direction: column;
+}
+.suggest-row {
+    font-family: inherit;
+    font-size: 12px;
+    text-align: left;
+    padding: 6px 10px;
+    border: none;
+    border-bottom: 1px solid var(--border2);
+    background: none;
+    color: var(--text1);
+    cursor: pointer;
+    word-break: break-all;
+}
+.suggest-row:last-child { border-bottom: none; }
+.suggest-row:hover { background: var(--bg2); color: var(--blue); }
+.suggest-empty { padding: 6px 10px; font-size: 11px; color: var(--text3); font-style: italic; }
+
 /* Recently traced values. Ids are unmemorable and unretypeable, so getting
    back to one has to be a single click. */
 .recent-row {
@@ -532,6 +572,35 @@ table.schema-table tr:hover td { background: var(--bg2); }
 .recent-clear:hover { color: var(--red); }
 
 .trace-panel { border-color: var(--blue); }
+
+/* Fragment search hit several ids — choose before drawing anything. */
+.match-list {
+    margin-top: 12px;
+    display: flex;
+    flex-direction: column;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    max-height: 260px;
+    overflow-y: auto;
+}
+.match-row {
+    font-family: inherit;
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    text-align: left;
+    padding: 8px 12px;
+    border: none;
+    border-bottom: 1px solid var(--border2);
+    background: none;
+    cursor: pointer;
+}
+.match-row:last-child { border-bottom: none; }
+.match-row:hover { background: var(--bg2); }
+.match-value { font-size: 12px; color: var(--blue); word-break: break-all; }
+.match-count { font-size: 10px; color: var(--text3); white-space: nowrap; }
 .trace-scroll { overflow-x: auto; overflow-y: hidden; margin-top: 12px; padding-bottom: 6px; }
 .trace-track { position: relative; }
 
@@ -774,7 +843,42 @@ table.schema-table tr:hover td { background: var(--bg2); }
 .doc-head .btn { flex: 0 0 auto; padding: 3px 9px; }
 .doc-source { font-size: 11px; color: var(--text3); }
 
-.doc-body { flex: 1; overflow: auto; margin-top: 10px; }
+.doc-body {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    margin-top: 10px;
+}
+.doc-body .doc-json { flex: 1; overflow: auto; }
+
+/* Quiet until you go looking for it, so it doesn't compete with the JSON. */
+.doc-copy {
+    position: absolute;
+    top: 8px;
+    right: 12px;
+    font-family: inherit;
+    font-size: 10px;
+    letter-spacing: 0.04em;
+    padding: 3px 9px;
+    border-radius: 5px;
+    border: 1px solid var(--border);
+    background: var(--bg2);
+    color: var(--text3);
+    cursor: pointer;
+    opacity: 0.55;
+    transition: opacity 0.12s, color 0.12s, border-color 0.12s, background 0.12s;
+}
+.doc-body:hover .doc-copy { opacity: 1; }
+.doc-copy:hover { color: var(--blue); border-color: var(--blue); }
+/* Confirmation reads as a state change on the control itself — no floating
+   bubble to chase, and it can't be missed by looking elsewhere. */
+.doc-copy.done {
+    opacity: 1;
+    color: var(--green);
+    border-color: var(--green);
+    background: rgba(63,185,80,0.12);
+}
 .doc-json {
     font-family: inherit;
     font-size: 11px;

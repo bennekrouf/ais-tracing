@@ -91,7 +91,11 @@ jobs:
           key: release-macos-arm64-cargo-${{ hashFiles('Cargo.lock') }}
 
       # ── Sanity-check required signing secrets up front ─────────────────────
-      - name: Verify macOS signing secrets are present
+      # Signing needs all seven secrets. With none of them configured the
+      # sensible outcome is "no macOS build in this release", not "no release
+      # at all" — Windows and Linux are unaffected and still ship. A partial
+      # set is a genuine misconfiguration and still fails loudly.
+      - name: Check macOS signing secrets
         env:
           MACOS_CERTIFICATE:     ${{ secrets.MACOS_CERTIFICATE }}
           MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
@@ -105,15 +109,24 @@ jobs:
           [ -z "${MACOS_CERTIFICATE:-}"     ] && missing+=("MACOS_CERTIFICATE")
           [ -z "${MACOS_CERTIFICATE_PWD:-}" ] && missing+=("MACOS_CERTIFICATE_PWD")
           [ -z "${KEYCHAIN_PASSWORD:-}"     ] && missing+=("KEYCHAIN_PASSWORD")
-          if [ ${#missing[@]} -gt 0 ]; then
-            echo "::error::Missing GitHub Actions secrets: ${missing[*]}"
-            echo "Add them in: Settings → Secrets and variables → Actions"
+
+          if [ ${#missing[@]} -eq 0 ]; then
+            echo "All 7 macOS signing secrets present."
+            echo "HAVE_MAC_SECRETS=true" >> "$GITHUB_ENV"
+          elif [ ${#missing[@]} -eq 7 ]; then
+            echo "::warning::No macOS signing secrets configured — skipping the macOS build. \
+          This release will ship Windows and Linux only. Add the 7 secrets in \
+          Settings → Secrets and variables → Actions to include a signed .dmg."
+            echo "HAVE_MAC_SECRETS=false" >> "$GITHUB_ENV"
+          else
+            echo "::error::Incomplete macOS signing configuration. Missing: ${missing[*]}"
+            echo "Set all seven, or none at all to skip the macOS build."
             exit 1
           fi
-          echo "All 7 macOS signing secrets present."
 
       # ── Import Developer ID cert into a temporary keychain ─────────────────
       - name: Set up signing keychain
+        if: env.HAVE_MAC_SECRETS == 'true'
         env:
           MACOS_CERTIFICATE:     ${{ secrets.MACOS_CERTIFICATE }}
           MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
@@ -140,10 +153,12 @@ jobs:
           echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
 
       - name: Build
+        if: env.HAVE_MAC_SECRETS == 'true'
         run: cargo build --release --target aarch64-apple-darwin
 
       # ── Sign the binary with hardened runtime + webview entitlements ───────
       - name: Codesign binary
+        if: env.HAVE_MAC_SECRETS == 'true'
         run: |
           set -euo pipefail
           BIN=target/aarch64-apple-darwin/release/ais-tracing
@@ -156,6 +171,7 @@ jobs:
       # ── Generate icon.icns from assets/icon.png (1024x1024 source) ─────────
       # No-op if the PNG is absent; bundle just ships icon-less in that case.
       - name: Generate macOS .icns
+        if: env.HAVE_MAC_SECRETS == 'true'
         run: |
           set -euo pipefail
           if [ ! -f assets/icon.png ]; then
@@ -179,6 +195,7 @@ jobs:
 
       # ── Wrap binary in .app bundle, build signed + notarized + stapled DMG ─
       - name: Build .app + .dmg
+        if: env.HAVE_MAC_SECRETS == 'true'
         run: |
           set -euo pipefail
           BIN=target/aarch64-apple-darwin/release/ais-tracing
@@ -245,11 +262,12 @@ jobs:
             > dist/ais-tracing-macos-arm64.dmg.sha256
 
       - name: Clean up keychain
-        if: always()
+        if: always() && env.HAVE_MAC_SECRETS == 'true'
         run: |
           security delete-keychain "$KEYCHAIN_PATH" || true
 
       - name: Upload artifact
+        if: env.HAVE_MAC_SECRETS == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ais-tracing-macos-arm64
@@ -423,10 +441,9 @@ jobs:
 
   release:
     needs: [build-mac, build-windows, build-linux]
-    # Mirror the build jobs: skipped `prepare` (the tag-push path doesn't run
-    # it) propagates through the default `if: success()` and would skip
-    # `release` too. Override so we only skip on genuine failure / cancel.
-    if: always() && !failure() && !cancelled()
+    # Publish whatever built. A platform that failed must not take the others
+    # down with it — that is how three green artifacts ended up unreleased.
+    if: always() && !cancelled()
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -440,21 +457,44 @@ jobs:
           path: artifacts
 
       - name: Flatten artifacts + generate latest.json
+        id: stage
         env:
           REPO: ${{ github.repository }}
           TAG:  ${{ github.ref_name }}
         run: |
+          set -euo pipefail
           mkdir -p release
-          find artifacts -type f -exec cp {} release/ \;
-          ls -lh release/
+          find artifacts -type f -exec cp {} release/ \; 2>/dev/null || true
+          ls -lh release/ || true
 
-          VER="${TAG#v}"
-          BASE="https://github.com/$REPO/releases/download/$TAG"
           MAC_DMG="ais-tracing-macos-arm64.dmg"
           WIN_EXE="ais-tracing-setup.exe"
           LINUX_TGZ="ais-tracing-linux-x86_64.tar.gz"
 
-          sha() { [ -n "$1" ] && [ -f "release/$1" ] && sha256sum "release/$1" | awk '{print $1}' || echo ""; }
+          have() { [ -f "release/$1" ] && echo true || echo false; }
+          HAVE_MAC=$(have "$MAC_DMG")
+          HAVE_WIN=$(have "$WIN_EXE")
+          HAVE_LINUX=$(have "$LINUX_TGZ")
+
+          # Nothing at all means every build failed; a release with no
+          # downloads is worse than a red run, so stop here.
+          if [ "$HAVE_MAC" = false ] && [ "$HAVE_WIN" = false ] && [ "$HAVE_LINUX" = false ]; then
+            echo "::error::No platform artifacts were produced — nothing to release."
+            exit 1
+          fi
+
+          {
+            echo "have_mac=$HAVE_MAC"
+            echo "have_win=$HAVE_WIN"
+            echo "have_linux=$HAVE_LINUX"
+          } >> "$GITHUB_OUTPUT"
+
+          VER="${TAG#v}"
+          BASE="https://github.com/$REPO/releases/download/$TAG"
+          # An absent platform gets empty url and sha rather than a link that
+          # 404s — a consumer must be able to tell "not built" from "here".
+          sha() { [ -f "release/$1" ] && sha256sum "release/$1" | awk '{print $1}' || echo ""; }
+          url() { [ -f "release/$1" ] && echo "$BASE/$1" || echo ""; }
 
           cat > release/latest.json <<EOF
           {
@@ -463,58 +503,84 @@ jobs:
             "tag": "$TAG",
             "released_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
             "platforms": {
-              "macos":   { "dmg":    { "url": "$BASE/$MAC_DMG",   "sha256": "$(sha "$MAC_DMG")"   } },
-              "windows": { "exe_or_msi": { "url": "$BASE/$WIN_EXE", "sha256": "$(sha "$WIN_EXE")" } },
-              "linux":   { "tarball": { "url": "$BASE/$LINUX_TGZ", "sha256": "$(sha "$LINUX_TGZ")" } }
+              "macos":   { "dmg":    { "url": "$(url "$MAC_DMG")",   "sha256": "$(sha "$MAC_DMG")"   } },
+              "windows": { "exe_or_msi": { "url": "$(url "$WIN_EXE")", "sha256": "$(sha "$WIN_EXE")" } },
+              "linux":   { "tarball": { "url": "$(url "$LINUX_TGZ")", "sha256": "$(sha "$LINUX_TGZ")" } }
             }
           }
           EOF
-          cp release/latest.json artifacts/  # so gh release attaches it
+          cp release/latest.json artifacts/
           cat release/latest.json
+
+      # Notes list only the platforms actually present, so nobody is sent to a
+      # download link that 404s.
+      - name: Compose release notes
+        env:
+          REPO: ${{ github.repository }}
+          TAG:  ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Desktop app"
+            echo
+
+            if [ "${{ steps.stage.outputs.have_mac }}" = "true" ]; then
+              echo "### macOS (Apple Silicon)"
+              echo "Download \`ais-tracing-macos-arm64.dmg\`, open it, and drag AIS Tracing to /Applications."
+              echo "Signed with Apple Developer ID and notarized — opens with a normal double-click."
+              echo
+            fi
+
+            if [ "${{ steps.stage.outputs.have_win }}" = "true" ]; then
+              echo "### Windows"
+              echo "Download and run:"
+              echo "\`https://github.com/$REPO/releases/latest/download/ais-tracing-setup.exe\`"
+              echo
+              echo "The installer isn't code-signed yet — SmartScreen will warn; choose **More info → Run anyway**."
+              echo
+            fi
+
+            if [ "${{ steps.stage.outputs.have_linux }}" = "true" ]; then
+              echo "### Linux (x86_64)"
+              echo '```bash'
+              echo "curl -L https://github.com/$REPO/releases/download/$TAG/ais-tracing-linux-x86_64.tar.gz | tar xz"
+              echo "cd ais-tracing-linux-x86_64"
+              echo "sudo ./setup-linux.sh && ./ais-tracing"
+              echo '```'
+              echo
+            fi
+
+            if [ "${{ steps.stage.outputs.have_mac }}" != "true" ]; then
+              echo "> macOS build not included in this release."
+              echo
+            fi
+
+            echo "## First run"
+            echo
+            echo "ais-tracing reads your existing Azure CLI session — no separate sign-in:"
+            echo
+            echo '```'
+            echo "az login"
+            echo '```'
+            echo
+            echo "Then pick a Cosmos DB account, and it samples every container to work out"
+            echo "which field correlates a flow."
+          } > notes.md
+          cat notes.md
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           TAG="${{ github.ref_name }}"
           FILES=$(find artifacts -type f | tr '\n' ' ')
 
           # `--latest` forces this release to be flagged "Latest" in the GitHub
-          # UI and via the `/releases/latest` API. Without it, the repo's
-          # "latest release preference" (which may be set to manually-pinned)
-          # decides — and an old stray release can hang on as latest.
+          # UI and via the `/releases/latest` API, so the stable download URLs
+          # keep resolving.
           gh release create "$TAG" \
             --latest \
             --title "ais-tracing $TAG" \
-            --notes "$(cat <<'EOF'
-          ## Desktop app
-
-          ### macOS (Apple Silicon)
-          Download `ais-tracing-macos-arm64.dmg`, open it, and drag AIS Tracing to /Applications.
-          Signed with Apple Developer ID and notarized — opens with a normal double-click.
-
-          ### Windows
-          Download `ais-tracing-setup.exe` from this release and run it. The same
-          URL also serves the latest version directly:
-          `https://github.com/${{ github.repository }}/releases/latest/download/ais-tracing-setup.exe`
-
-          ### Linux (x86_64)
-          ```bash
-          curl -L https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/ais-tracing-linux-x86_64.tar.gz | tar xz
-          cd ais-tracing-linux-x86_64
-          sudo ./setup-linux.sh && ./ais-tracing
-          ```
-
-          ## First run
-
-          ais-tracing reads your existing Azure CLI session — no separate sign-in:
-
-          ```
-          az login
-          ```
-
-          Then pick a Cosmos DB account, and it samples every container to work out
-          which field correlates a flow.
-          EOF
-          )" \
+            --notes-file notes.md \
             $FILES

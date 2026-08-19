@@ -90,6 +90,9 @@ pub struct Block {
     /// Where the document actually lives. Once lanes can be something other
     /// than containers, the card is the only thing that still knows.
     pub container: String,
+    /// The correlation value this document actually carries. With fragment
+    /// search that need not equal what the user typed.
+    pub key_value: String,
     /// The document as returned, for the detail panel. A card can only ever
     /// show a summary; this is what it summarises.
     pub doc: Value,
@@ -134,6 +137,12 @@ pub struct Trace {
     /// Earliest and latest observed times, when any were found.
     pub span: Option<(i64, i64)>,
     pub blocks_found: usize,
+    /// True when the value was matched as a fragment rather than in full.
+    pub partial: bool,
+    /// Distinct key values the search hit, with their document counts. More
+    /// than one means the fragment is ambiguous and the timeline would be
+    /// mixing unrelated flows.
+    pub matches: Vec<(String, usize)>,
 }
 
 impl Trace {
@@ -162,11 +171,67 @@ impl Trace {
     }
 }
 
+/// Shortest fragment worth scanning for. Below this almost everything
+/// matches, and the scan is wasted.
+pub const MIN_FRAGMENT: usize = 4;
+/// Suggestions offered for a fragment before it's simply too vague.
+const MAX_SUGGESTIONS: usize = 25;
+
+/// The distinct key values containing `fragment`, for a type-ahead.
+///
+/// Deliberately not `run`: this asks Cosmos for `DISTINCT VALUE <field>`, so
+/// it returns a handful of strings rather than every matching document. That
+/// is the difference between a search you can run while someone types and one
+/// you can't.
+pub async fn suggest(
+    endpoint: &str,
+    containers: &[String],
+    key: &KeyCandidate,
+    fragment: &str,
+) -> Vec<String> {
+    let fragment = fragment.trim();
+    if fragment.len() < MIN_FRAGMENT {
+        return Vec::new();
+    }
+    let Ok(client) = cosmos::connect(endpoint).await else {
+        return Vec::new();
+    };
+
+    let mut found: BTreeSet<String> = BTreeSet::new();
+    for path in containers {
+        let Some((database, container)) = path.split_once('/') else {
+            continue;
+        };
+        let Some(binding) = key.binding_for(path) else {
+            continue;
+        };
+
+        let sql = sql_path(&binding.field);
+        let text = format!(
+            "SELECT DISTINCT VALUE {sql} FROM c \
+             WHERE IS_STRING({sql}) AND CONTAINS({sql}, @v, true)"
+        );
+        let Ok(query) = Query::from(text).with_parameter("@v", fragment) else {
+            continue;
+        };
+
+        // A container that can't be read shouldn't silence the others.
+        if let Ok(values) =
+            cosmos::query_documents(&client, database, container, query, MAX_SUGGESTIONS).await
+        {
+            found.extend(values.iter().filter_map(|v| v.as_str().map(str::to_string)));
+        }
+        if found.len() >= MAX_SUGGESTIONS {
+            break;
+        }
+    }
+
+    found.into_iter().take(MAX_SUGGESTIONS).collect()
+}
+
 /// Queries every container bound to the key, plus records the ones that
 /// aren't bound at all so the view can show the difference.
 pub async fn run(endpoint: &str, containers: &[String], spec: &TraceSpec) -> Trace {
-    let mut lanes = Vec::new();
-
     // One client for every container — rebuilding it per query re-resolved
     // credentials each time and dominated the wait.
     let client = match cosmos::connect(endpoint).await {
@@ -177,6 +242,8 @@ pub async fn run(endpoint: &str, containers: &[String], spec: &TraceSpec) -> Tra
                 key_label: spec.key.label.clone(),
                 blocks_found: 0,
                 span: None,
+                partial: false,
+                matches: Vec::new(),
                 lanes: containers
                     .iter()
                     .map(|path| Lane {
@@ -190,6 +257,30 @@ pub async fn run(endpoint: &str, containers: &[String], spec: &TraceSpec) -> Tra
             }
         }
     };
+
+    // Exact first: it uses the index and is the overwhelmingly common case.
+    // Only when nothing carries that value do we fall back to scanning for it
+    // as a fragment, which lets a user paste the first block of a uuid.
+    let exact = fetch(&client, containers, spec, false).await;
+    if exact.blocks_found > 0 || spec.value.trim().is_empty() {
+        return exact;
+    }
+    let fragment = fetch(&client, containers, spec, true).await;
+    if fragment.blocks_found == 0 {
+        // Nothing either way — report the exact attempt, whose lane states
+        // describe the account rather than a failed scan.
+        return exact;
+    }
+    fragment
+}
+
+async fn fetch(
+    client: &azure_data_cosmos::CosmosClient,
+    containers: &[String],
+    spec: &TraceSpec,
+    partial: bool,
+) -> Trace {
+    let mut lanes = Vec::new();
 
     for path in containers {
         let Some((database, container)) = path.split_once('/') else {
@@ -206,8 +297,8 @@ pub async fn run(endpoint: &str, containers: &[String], spec: &TraceSpec) -> Tra
             continue;
         };
 
-        let query = build_query(&binding.field, &spec.value);
-        match cosmos::query_documents(&client, database, container, query, MAX_BLOCKS).await {
+        let query = build_query(&binding.field, &spec.value, partial);
+        match cosmos::query_documents(client, database, container, query, MAX_BLOCKS).await {
             Ok(docs) => {
                 let mut blocks: Vec<Block> = docs
                     .iter()
@@ -253,12 +344,29 @@ pub async fn run(endpoint: &str, containers: &[String], spec: &TraceSpec) -> Tra
         _ => None,
     };
 
+    // Which distinct correlation values the search actually landed on. For an
+    // exact search that is always one; a fragment can straddle several, and
+    // the caller has to disambiguate before drawing a timeline.
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for block in lanes.iter().flat_map(|l| l.blocks.iter()) {
+        if !block.key_value.is_empty() {
+            *counts.entry(block.key_value.as_str()).or_default() += 1;
+        }
+    }
+    let mut matches: Vec<(String, usize)> = counts
+        .into_iter()
+        .map(|(v, n)| (v.to_string(), n))
+        .collect();
+    matches.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+
     Trace {
         value: spec.value.clone(),
         key_label: spec.key.label.clone(),
         blocks_found: lanes.iter().map(|l| l.blocks.len()).sum(),
         lanes,
         span,
+        partial,
+        matches,
     }
 }
 
@@ -354,8 +462,20 @@ fn regroup(container_lanes: Vec<Lane>, lane_field: &str, expected_lanes: &[Strin
     lanes
 }
 
-fn build_query(field: &str, value: &str) -> Query {
+fn build_query(field: &str, value: &str, partial: bool) -> Query {
     let path = sql_path(field);
+
+    if partial {
+        // CONTAINS can't use the index, so this is a scan — acceptable as a
+        // fallback, not as the default path. IS_STRING guards it: CONTAINS
+        // against a non-string errors out the whole query.
+        let text =
+            format!("SELECT * FROM c WHERE IS_STRING({path}) AND CONTAINS({path}, @v, true)");
+        return Query::from(text)
+            .with_parameter("@v", value)
+            .unwrap_or_else(|_| Query::from(format!("SELECT * FROM c WHERE {path} = null")));
+    }
+
     // Cosmos is typed: a numeric id stored as a number won't match a string
     // parameter, and the user just typed characters. Try both when the input
     // could be either.
@@ -449,6 +569,9 @@ fn build_block(
 
     Block {
         id: id.to_string(),
+        key_value: lookup(doc, &key_field.to_lowercase())
+            .and_then(scalar_text)
+            .unwrap_or_default(),
         label,
         at,
         at_text: at.map(format_time).unwrap_or_default(),
@@ -569,6 +692,39 @@ mod tests {
         assert_eq!(sql_path(r#"od"d"#), r#"c["od\"d"]"#);
     }
 
+    fn query_text(q: &Query) -> String {
+        serde_json::to_value(q).unwrap()["query"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn exact_search_stays_an_indexed_equality() {
+        let text = query_text(&build_query("correlationId", "9b538528-aaaa", false));
+        assert!(text.contains(r#"c["correlationId"] = @v"#), "{text}");
+        assert!(!text.contains("CONTAINS"), "{text}");
+    }
+
+    #[test]
+    fn fragment_search_guards_contains_with_is_string() {
+        let text = query_text(&build_query("correlationId", "9b538528", true));
+        // Without IS_STRING, a container holding a numeric value under the
+        // same field fails the whole query rather than just not matching.
+        assert!(text.contains(r#"IS_STRING(c["correlationId"])"#), "{text}");
+        assert!(text.contains(r#"CONTAINS(c["correlationId"], @v, true)"#), "{text}");
+    }
+
+    /// A numeric-looking input must not turn into a numeric comparison on the
+    /// fragment path — CONTAINS is a string operation.
+    #[test]
+    fn a_numeric_fragment_does_not_gain_a_numeric_parameter() {
+        let exact = serde_json::to_value(build_query("orderId", "12345", false)).unwrap();
+        let fragment = serde_json::to_value(build_query("orderId", "12345", true)).unwrap();
+        assert_eq!(exact["parameters"].as_array().unwrap().len(), 2);
+        assert_eq!(fragment["parameters"].as_array().unwrap().len(), 1);
+    }
+
     #[test]
     fn nested_lookup_ignores_case() {
         let doc = json!({ "Properties": { "CorrelationId": "abc" } });
@@ -677,6 +833,7 @@ mod tests {
                 at_text: String::new(),
                 facts: vec![],
                 container: "db/c".into(),
+                key_value: "abc".into(),
                 doc: json!({ "n": i }),
             })
             .collect();
@@ -686,6 +843,8 @@ mod tests {
             value: "abc".into(),
             key_label: "k".into(),
             blocks_found: blocks.len(),
+            partial: false,
+            matches: vec![],
             span: Some((0, 200)),
             lanes: vec![Lane {
                 name: "db/c".into(),
@@ -715,6 +874,7 @@ mod tests {
             at_text: String::new(),
             facts: vec![],
             container: container.into(),
+            key_value: "abc".into(),
             doc: match workflow {
                 Some(w) => json!({ "workflowName": w }),
                 None => json!({}),
@@ -831,6 +991,8 @@ mod tests {
             value: "abc".into(),
             key_label: "correlationId".into(),
             blocks_found: 2,
+            partial: false,
+            matches: vec![],
             span: Some((0, 200)),
             lanes: vec![
                 container_lane(
@@ -874,6 +1036,7 @@ mod tests {
             at_text: String::new(),
             facts: vec![],
             container: container.into(),
+            key_value: "abc".into(),
             doc: match schema {
                 Some(s) => json!({ "correlationId": "c50f1a6a", "schema": s }),
                 None => json!({ "correlationId": "c50f1a6a" }),
@@ -884,6 +1047,8 @@ mod tests {
             value: "c50f1a6a".into(),
             key_label: "correlationId".into(),
             blocks_found: 4,
+            partial: false,
+            matches: vec![],
             span: Some((0, 11_000)),
             lanes: vec![
                 // Sessions documents have no `schema` field at all.
