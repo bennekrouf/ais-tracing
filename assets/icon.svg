@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ais-tracing app icon.
+  Fourth of the family: same squircle, same white mark under the same soft
+  glow as ais-monitor and ais-runner, carrying this app's own hue (amber)
+  the way its window chrome does.
+
+  The mark is what the app draws: three lanes, and one correlation value
+  threaded down through them. The faint rails are the lanes, the thread is
+  the value, the nodes are where it was found. They vanish below about
+  32px, the way the ais-monitor pulse line does, leaving the three nodes on
+  their diagonal as the silhouette.
+
+  Round nodes, because what is found here is a document: Cosmos DB stores
+  blobs of JSON, not rows. Its Log Analytics sibling uses squares for the
+  same reason in reverse.
+
+  Designed at 1024 to read down to 16x16.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <!-- Background: amber, matching the accent in main.css but held
+         several steps darker. Amber is intrinsically light, so this is the
+         one icon in the set that cannot be both vivid and high-contrast:
+         the raw UI accent (#ffa726) puts the white mark at 1.9:1, and
+         pushing to the 4.5:1 the blue and violet icons reach turns the
+         ground brown and stops reading as amber at all. 3.7:1 keeps it
+         gold while clearing the 3:1 floor that governs a large graphical
+         mark. The gradient is also compressed rather than falling to near
+         black the way the blue and violet ones do: a dark blue is still
+         blue, but a dark amber is brown, and half the tile turning brown
+         costs the tie back to the app chrome. -->
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%"  stop-color="#CC7A0C"/>
+      <stop offset="55%" stop-color="#B0670A"/>
+      <stop offset="100%" stop-color="#7A4708"/>
+    </linearGradient>
+    <!-- Mark: white with a hint of amber at the trailing end -->
+    <linearGradient id="mark" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%"  stop-color="#FFFFFF"/>
+      <stop offset="100%" stop-color="#FFE8C4"/>
+    </linearGradient>
+    <!-- Soft glow on the mark -->
+    <filter id="glow" x="-10%" y="-10%" width="120%" height="120%">
+      <feGaussianBlur stdDeviation="6" result="b"/>
+      <feMerge>
+        <feMergeNode in="b"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Squircle background (macOS-style continuous corner) -->
+  <rect x="64" y="64" width="896" height="896" rx="224" ry="224" fill="url(#bg)"/>
+
+  <!-- The lanes. Deliberately faint: they carry the meaning at large sizes
+       and drop away at small ones, so the silhouette stays the thread. -->
+  <g fill="#FFD79A" opacity="0.3">
+    <rect x="200" y="300" width="624" height="40" rx="20"/>
+    <rect x="200" y="492" width="624" height="40" rx="20"/>
+    <rect x="200" y="684" width="624" height="40" rx="20"/>
+  </g>
+
+  <!-- The trace: one value threaded down through the lanes. The bend is
+       deliberate; evenly spaced nodes would fall on a straight line and
+       read as a ruler rather than a path. -->
+  <g filter="url(#glow)">
+    <path d="M 312 320 L 556 512 L 712 704"
+          stroke="url(#mark)" stroke-width="40"
+          stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+    <circle cx="312" cy="320" r="78" fill="url(#mark)"/>
+    <circle cx="556" cy="512" r="78" fill="url(#mark)"/>
+    <circle cx="712" cy="704" r="78" fill="url(#mark)"/>
+  </g>
+</svg>
