@@ -2,17 +2,13 @@ use crate::services::az::{self, AzLoginState, CosmosAccount};
 use crate::services::history;
 use dioxus::prelude::*;
 
-#[derive(Props, Clone, PartialEq)]
-pub struct WelcomeProps {
-    pub on_connect: EventHandler<CosmosAccount>,
-}
-
 /// Sign-in + Cosmos account picker. Same shape as ais-monitor's `Welcome`
 /// screen: check `az login`, offer to connect if not signed in, then let
 /// the user pick the resource to work with — here a Cosmos DB account
-/// instead of a Logic App.
+/// instead of a Logic App. Connecting always opens a new window; this one
+/// stays put as the launcher.
 #[component]
-pub fn Welcome(props: WelcomeProps) -> Element {
+pub fn Welcome() -> Element {
     let mut az_state = use_signal(|| AzLoginState::AzNotFound);
     let mut checking = use_signal(|| true);
     let mut accounts = use_signal(Vec::<CosmosAccount>::new);
@@ -159,12 +155,11 @@ pub fn Welcome(props: WelcomeProps) -> Element {
                                     disabled: !can_connect,
                                     onclick: {
                                         let list = list.clone();
-                                        let on_connect = props.on_connect.clone();
                                         move |_| {
                                             let name = selected_name.read().clone();
                                             if let Some(acc) = list.iter().find(|a| a.name == name).cloned() {
                                                 recent.set(history::record_account(&acc));
-                                                on_connect.call(acc);
+                                                crate::open_in_new_window(acc);
                                             }
                                         }
                                     },
@@ -193,10 +188,9 @@ pub fn Welcome(props: WelcomeProps) -> Element {
                                             disabled: !is_logged_in,
                                             onclick: {
                                                 let acc = acc.clone();
-                                                let on_connect = props.on_connect.clone();
                                                 move |_| {
                                                     recent.set(history::record_account(&acc));
-                                                    on_connect.call(acc.clone());
+                                                    crate::open_in_new_window(acc.clone());
                                                 }
                                             },
                                             "Open →"

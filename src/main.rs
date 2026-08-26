@@ -9,6 +9,47 @@ use services::az::CosmosAccount;
 
 const MAIN_CSS: &str = include_str!("../assets/main.css");
 
+fn webview_data_dir() -> std::path::PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("ais-tracing")
+}
+
+fn window_config(title: &str) -> dioxus::desktop::Config {
+    dioxus::desktop::Config::new()
+        .with_data_directory(webview_data_dir())
+        .with_window(
+            dioxus::desktop::WindowBuilder::new()
+                .with_title(title)
+                .with_inner_size(LogicalSize::new(1100.0, 760.0))
+                .with_always_on_top(false),
+        )
+}
+
+/// Opens another window on `account`, in this same process.
+///
+/// One process, many windows — not many processes. Two copies of the binary
+/// would race each other on cached history/config files. Windows inside one
+/// process share none of that: each gets its own VirtualDom and its own
+/// signals, and the OS sees a single app.
+pub fn open_in_new_window(account: CosmosAccount) {
+    let name = account.name.clone();
+    let dom = VirtualDom::new_with_props(
+        WindowRoot,
+        WindowRootProps {
+            initial: Some(account),
+        },
+    );
+    dioxus::desktop::window().new_window(
+        dom,
+        window_config(&format!(
+            "ais-tracing {} — {}",
+            env!("CARGO_PKG_VERSION"),
+            name
+        )),
+    );
+}
+
 fn main() {
     if std::env::var("RUST_LOG").is_err() {
         // SAFETY: single-threaded, before any other threads (e.g. tokio) start.
@@ -17,24 +58,22 @@ fn main() {
         }
     }
 
-    let webview_data_dir = dirs::data_local_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("ais-tracing");
-
-    let cfg = dioxus::desktop::Config::new()
-        .with_data_directory(webview_data_dir)
-        .with_window(
-            dioxus::desktop::WindowBuilder::new()
-                .with_title(concat!("ais-tracing ", env!("CARGO_PKG_VERSION")))
-                .with_inner_size(LogicalSize::new(1100.0, 760.0))
-                .with_always_on_top(false),
-        );
+    let cfg = window_config(concat!("ais-tracing ", env!("CARGO_PKG_VERSION")));
     dioxus::LaunchBuilder::desktop().with_cfg(cfg).launch(App);
 }
 
+/// The first window's root. Every other window is a `WindowRoot` too — this
+/// exists only because the launcher needs a component that takes no props.
 #[component]
 fn App() -> Element {
-    let mut account = use_signal(|| Option::<CosmosAccount>::None);
+    rsx! { WindowRoot { initial: Option::<CosmosAccount>::None } }
+}
+
+/// One window. Each has its own VirtualDom, so its own signals, its own theme
+/// state and its own open account — and its own welcome screen to go back to.
+#[component]
+fn WindowRoot(initial: Option<CosmosAccount>) -> Element {
+    let mut account = use_signal(|| initial);
 
     let system_light =
         dark_light::detect().unwrap_or(dark_light::Mode::Dark) != dark_light::Mode::Dark;
@@ -94,11 +133,7 @@ fn App() -> Element {
         }
 
         match current {
-            None => rsx! {
-                Welcome {
-                    on_connect: move |acc: CosmosAccount| account.set(Some(acc)),
-                }
-            },
+            None => rsx! { Welcome {} },
             Some(acc) => rsx! {
                 // The theme signal is owned here so it also covers Welcome;
                 // Home only needs it to render the toggle.
