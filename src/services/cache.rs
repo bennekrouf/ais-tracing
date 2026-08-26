@@ -86,7 +86,10 @@ mod tests {
             "https---cosmos-tom-dev-documents-azure-com-443"
         );
         // Two different accounts must never collide on one file.
-        assert_ne!(slug("https://a.documents.azure.com:443/"), slug("https://b.documents.azure.com:443/"));
+        assert_ne!(
+            slug("https://a.documents.azure.com:443/"),
+            slug("https://b.documents.azure.com:443/")
+        );
     }
 
     #[test]

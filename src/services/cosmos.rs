@@ -10,9 +10,9 @@
 //! about the domain.
 
 use azure_data_cosmos::{
+    AccountEndpoint, AccountReference, CosmosClient, Query, RoutingStrategy,
     feed::FeedScope,
     options::{MaxItemCountHint, QueryOptions},
-    AccountEndpoint, AccountReference, CosmosClient, Query, RoutingStrategy,
 };
 use azure_identity::DeveloperToolsCredential;
 use futures::StreamExt;
@@ -82,7 +82,6 @@ impl ContainerSchema {
     pub fn path(&self) -> String {
         format!("{}/{}", self.database, self.container)
     }
-
 }
 
 /// Builds one client for a whole run of work.
@@ -120,10 +119,7 @@ pub async fn list_databases(client: &CosmosClient) -> Result<Vec<String>, String
     Ok(names)
 }
 
-pub async fn list_containers(
-    client: &CosmosClient,
-    database: &str,
-) -> Result<Vec<String>, String> {
+pub async fn list_containers(client: &CosmosClient, database: &str) -> Result<Vec<String>, String> {
     let db = client.database_client(database);
     let mut items = db
         .query_containers("SELECT * FROM c", None)
@@ -188,7 +184,11 @@ pub async fn infer_container_schema(
         .unwrap_or_default();
 
     let mut items = container_client
-        .query_items::<Value>("SELECT * FROM c", FeedScope::full_container(), Some(options))
+        .query_items::<Value>(
+            "SELECT * FROM c",
+            FeedScope::full_container(),
+            Some(options),
+        )
         .await
         .map_err(|e| format!("query_items: {e}"))?;
 

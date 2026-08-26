@@ -285,8 +285,11 @@ fn build_candidate(nodes: &[Node], members: &[usize], all_paths: &[String]) -> K
     let reach = bindings.len();
     let count = best_per_container.len().max(1) as f32;
     let avg_fill = best_per_container.values().map(|n| n.fill).sum::<f32>() / count;
-    let avg_distinct_ratio =
-        best_per_container.values().map(|n| n.distinct_ratio).sum::<f32>() / count;
+    let avg_distinct_ratio = best_per_container
+        .values()
+        .map(|n| n.distinct_ratio)
+        .sum::<f32>()
+        / count;
     let id_shaped = best_per_container.values().filter(|n| n.id_shaped).count() * 2 > reach;
     let name_hint = best_per_container
         .values()
@@ -504,7 +507,10 @@ fn label_candidates(schemas: &[ContainerSchema]) -> Vec<RoleCandidate> {
         .into_iter()
         .map(|(id, (label, containers, distinct))| RoleCandidate {
             score: containers.len() as f32,
-            note: format!("{distinct} distinct values, in {} container(s)", containers.len()),
+            note: format!(
+                "{distinct} distinct values, in {} container(s)",
+                containers.len()
+            ),
             id,
             label,
             containers,
@@ -548,15 +554,24 @@ fn time_shaped(v: &str) -> bool {
     }
     match v.parse::<i64>() {
         // ~2001-09-09 to ~2096 in seconds, same window in milliseconds.
-        Ok(n) => (1_000_000_000..=4_000_000_000).contains(&n)
-            || (1_000_000_000_000..=4_000_000_000_000).contains(&n),
+        Ok(n) => {
+            (1_000_000_000..=4_000_000_000).contains(&n)
+                || (1_000_000_000_000..=4_000_000_000_000).contains(&n)
+        }
         Err(_) => false,
     }
 }
 
 /// A weak, convention-based hint — never decisive on its own.
 fn name_suggests_identifier(lower: &str) -> bool {
-    const HINTS: [&str; 6] = ["correlation", "trace", "requestid", "conversation", "session", "flowid"];
+    const HINTS: [&str; 6] = [
+        "correlation",
+        "trace",
+        "requestid",
+        "conversation",
+        "session",
+        "flowid",
+    ];
     HINTS.iter().any(|h| lower.contains(h))
 }
 
@@ -685,12 +700,18 @@ mod tests {
             container(
                 "shop",
                 "orders",
-                vec![field("orderRef", &ids), field("status", &["a", "a", "b", "b"])],
+                vec![
+                    field("orderRef", &ids),
+                    field("status", &["a", "a", "b", "b"]),
+                ],
             ),
             container(
                 "shop",
                 "events",
-                vec![field("entityId", &ids), field("status", &["a", "b", "b", "a"])],
+                vec![
+                    field("entityId", &ids),
+                    field("status", &["a", "b", "b", "a"]),
+                ],
             ),
         ];
 
@@ -723,7 +744,11 @@ mod tests {
         let ids = uuids();
         let schemas = vec![
             container("shop", "orders", vec![field("correlationId", &ids)]),
-            container("shop", "audit", vec![field("properties.correlationId", &ids)]),
+            container(
+                "shop",
+                "audit",
+                vec![field("properties.correlationId", &ids)],
+            ),
         ];
 
         let insights = analyze(&schemas);

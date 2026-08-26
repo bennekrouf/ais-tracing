@@ -234,14 +234,21 @@ pub fn Home(props: HomeProps) -> Element {
     // The open document, resolved from the selected card each render so it
     // can never drift out of step with the trace behind it. It belongs to the
     // Trace tab, so it folds away with the cards it came from.
-    let open_doc = selected_block.read().clone().filter(|_| !on_setup).and_then(|id| {
-        traced
-            .read()
-            .as_ref()
-            // The card's own container, not the lane — once lanes are field
-            // values the two are different things.
-            .and_then(|t| t.find_block(&id).map(|(_, b)| (b.container.clone(), b.clone())))
-    });
+    let open_doc = selected_block
+        .read()
+        .clone()
+        .filter(|_| !on_setup)
+        .and_then(|id| {
+            traced
+                .read()
+                .as_ref()
+                // The card's own container, not the lane — once lanes are field
+                // values the two are different things.
+                .and_then(|t| {
+                    t.find_block(&id)
+                        .map(|(_, b)| (b.container.clone(), b.clone()))
+                })
+        });
 
     rsx! {
         div { class: "app-shell",
@@ -497,7 +504,12 @@ impl Follow {
             else {
                 return;
             };
-            let facts = insights.labels.iter().take(6).map(|c| c.id.clone()).collect();
+            let facts = insights
+                .labels
+                .iter()
+                .take(6)
+                .map(|c| c.id.clone())
+                .collect();
             (key, insights.containers.clone(), facts)
         };
 
@@ -773,10 +785,7 @@ fn FollowValue(props: FollowValueProps) -> Element {
     let ready = !value.read().trim().is_empty() && !props.disabled;
     // Suppress the list once the box already holds one of its own suggestions
     // — otherwise picking one leaves a dropdown offering the thing you picked.
-    let exact_already = props
-        .suggestions
-        .iter()
-        .any(|s| *s == *value.read().trim());
+    let exact_already = props.suggestions.iter().any(|s| *s == *value.read().trim());
 
     let submit = move |_| {
         let v = value.read().trim().to_string();
@@ -881,7 +890,6 @@ fn shorten(value: &str) -> String {
     let tail: String = chars[chars.len() - 6..].iter().collect();
     format!("{head}…{tail}")
 }
-
 
 #[derive(Props, Clone, PartialEq)]
 struct ErrorRulesProps {
@@ -1101,7 +1109,11 @@ struct ContainerListProps {
 #[component]
 fn ContainerList(props: ContainerListProps) -> Element {
     let mut open = use_signal(BTreeSet::<String>::new);
-    let paths: Vec<String> = props.schemas.iter().map(cosmos::ContainerSchema::path).collect();
+    let paths: Vec<String> = props
+        .schemas
+        .iter()
+        .map(cosmos::ContainerSchema::path)
+        .collect();
     let all_open = !paths.is_empty() && paths.iter().all(|p| open.read().contains(p));
 
     if props.schemas.is_empty() {

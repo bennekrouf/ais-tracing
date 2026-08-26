@@ -15,7 +15,10 @@ fn az_command(args: &[&str]) -> Command {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AzLoginState {
-    LoggedIn { account: String, subscription_id: String },
+    LoggedIn {
+        account: String,
+        subscription_id: String,
+    },
     NotLoggedIn,
     AzNotFound,
 }
@@ -34,7 +37,10 @@ pub fn check_login() -> AzLoginState {
         Ok(out) if out.status.success() => {
             let body = String::from_utf8_lossy(&out.stdout);
             match serde_json::from_str::<AzAccount>(&body) {
-                Ok(acc) => AzLoginState::LoggedIn { account: acc.name, subscription_id: acc.id },
+                Ok(acc) => AzLoginState::LoggedIn {
+                    account: acc.name,
+                    subscription_id: acc.id,
+                },
                 Err(_) => AzLoginState::NotLoggedIn,
             }
         }
@@ -47,16 +53,13 @@ pub fn check_login() -> AzLoginState {
 /// Opens `az login` (non-blocking) so the desktop app doesn't have to embed
 /// its own OAuth flow — same approach as ais-monitor.
 pub fn open_login() -> Result<(), String> {
-    az_command(&["login"])
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                "Azure CLI ('az') not found on PATH.".to_string()
-            } else {
-                format!("Failed to start 'az login': {e}")
-            }
-        })
+    az_command(&["login"]).spawn().map(|_| ()).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            "Azure CLI ('az') not found on PATH.".to_string()
+        } else {
+            format!("Failed to start 'az login': {e}")
+        }
+    })
 }
 
 fn list_subscription_ids() -> Result<Vec<String>, String> {
@@ -97,20 +100,25 @@ pub fn list_cosmos_accounts() -> Result<Vec<CosmosAccount>, String> {
     let mut accounts = Vec::new();
     for sub_id in sub_ids {
         let output = az_command(&[
-                "cosmosdb", "list",
-                "--subscription", sub_id.as_str(),
-                "--query", "[].{name:name,resourceGroup:resourceGroup,documentEndpoint:documentEndpoint}",
-                "--output", "json",
-            ])
-            .output()
-            .map_err(|e| format!("az cosmosdb list failed: {e}"))?;
+            "cosmosdb",
+            "list",
+            "--subscription",
+            sub_id.as_str(),
+            "--query",
+            "[].{name:name,resourceGroup:resourceGroup,documentEndpoint:documentEndpoint}",
+            "--output",
+            "json",
+        ])
+        .output()
+        .map_err(|e| format!("az cosmosdb list failed: {e}"))?;
         if !output.status.success() {
             // A subscription the caller can't read (PIM not activated, etc.)
             // shouldn't block discovery in the others.
             continue;
         }
         let body = String::from_utf8_lossy(&output.stdout);
-        let mut found: Vec<CosmosAccount> = serde_json::from_str(&body).map_err(|e| format!("parse: {e}"))?;
+        let mut found: Vec<CosmosAccount> =
+            serde_json::from_str(&body).map_err(|e| format!("parse: {e}"))?;
         for acc in &mut found {
             acc.subscription_id = sub_id.clone();
         }
@@ -128,9 +136,17 @@ const DATA_READER_ROLE_ID: &str = "00000000-0000-0000-0000-000000000001";
 /// The signed-in user's Entra object id — needed as the `principal-id` for
 /// a Cosmos SQL role assignment.
 fn signed_in_principal_id() -> Result<String, String> {
-    let output = az_command(&["ad", "signed-in-user", "show", "--query", "id", "--output", "tsv"])
-        .output()
-        .map_err(|e| format!("az ad signed-in-user show failed: {e}"))?;
+    let output = az_command(&[
+        "ad",
+        "signed-in-user",
+        "show",
+        "--query",
+        "id",
+        "--output",
+        "tsv",
+    ])
+    .output()
+    .map_err(|e| format!("az ad signed-in-user show failed: {e}"))?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
@@ -146,16 +162,26 @@ pub fn grant_self_cosmos_data_reader(account: &CosmosAccount) -> Result<(), Stri
         account.subscription_id, account.resource_group, account.name,
     );
     let output = az_command(&[
-            "cosmosdb", "sql", "role", "assignment", "create",
-            "--subscription", &account.subscription_id,
-            "--resource-group", &account.resource_group,
-            "--account-name", &account.name,
-            "--role-definition-id", DATA_READER_ROLE_ID,
-            "--principal-id", &principal_id,
-            "--scope", &scope,
-        ])
-        .output()
-        .map_err(|e| format!("az cosmosdb sql role assignment create failed: {e}"))?;
+        "cosmosdb",
+        "sql",
+        "role",
+        "assignment",
+        "create",
+        "--subscription",
+        &account.subscription_id,
+        "--resource-group",
+        &account.resource_group,
+        "--account-name",
+        &account.name,
+        "--role-definition-id",
+        DATA_READER_ROLE_ID,
+        "--principal-id",
+        &principal_id,
+        "--scope",
+        &scope,
+    ])
+    .output()
+    .map_err(|e| format!("az cosmosdb sql role assignment create failed: {e}"))?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
