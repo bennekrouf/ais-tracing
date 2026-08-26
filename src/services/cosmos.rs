@@ -10,9 +10,9 @@
 //! about the domain.
 
 use azure_data_cosmos::{
-    AccountEndpoint, AccountReference, CosmosClient, Query, RoutingStrategy,
     feed::FeedScope,
     options::{MaxItemCountHint, QueryOptions},
+    AccountEndpoint, AccountReference, CosmosClient, Query, RoutingStrategy,
 };
 use azure_identity::DeveloperToolsCredential;
 use futures::StreamExt;
