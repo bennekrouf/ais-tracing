@@ -254,7 +254,7 @@ pub async fn run(endpoint: &str, containers: &[String], spec: &TraceSpec) -> Tra
                         error: Some(e.clone()),
                     })
                     .collect(),
-            }
+            };
         }
     };
 
@@ -486,13 +486,13 @@ fn build_query(field: &str, value: &str, partial: bool) -> Query {
     };
 
     let query = Query::from(text);
-    let query = query.with_parameter("@v", value).unwrap_or_else(|_| {
-        Query::from(format!("SELECT * FROM c WHERE {path} = null"))
-    });
+    let query = query
+        .with_parameter("@v", value)
+        .unwrap_or_else(|_| Query::from(format!("SELECT * FROM c WHERE {path} = null")));
     match numeric {
-        Some(n) => query.with_parameter("@n", n).unwrap_or_else(|_| {
-            Query::from(format!("SELECT * FROM c WHERE {path} = null"))
-        }),
+        Some(n) => query
+            .with_parameter("@n", n)
+            .unwrap_or_else(|_| Query::from(format!("SELECT * FROM c WHERE {path} = null"))),
         None => query,
     }
 }
@@ -517,10 +517,7 @@ fn build_block(
     id: &str,
 ) -> Block {
     // The bare container name reads better on a card than `db/container`.
-    let container = container_path
-        .rsplit('/')
-        .next()
-        .unwrap_or(container_path);
+    let container = container_path.rsplit('/').next().unwrap_or(container_path);
 
     let at = if spec.time_field.is_empty() {
         None
@@ -712,7 +709,10 @@ mod tests {
         // Without IS_STRING, a container holding a numeric value under the
         // same field fails the whole query rather than just not matching.
         assert!(text.contains(r#"IS_STRING(c["correlationId"])"#), "{text}");
-        assert!(text.contains(r#"CONTAINS(c["correlationId"], @v, true)"#), "{text}");
+        assert!(
+            text.contains(r#"CONTAINS(c["correlationId"], @v, true)"#),
+            "{text}"
+        );
     }
 
     /// A numeric-looking input must not turn into a numeric comparison on the
@@ -788,10 +788,12 @@ mod tests {
         assert_eq!(block.at, Some(1_767_178_800_000));
         assert_eq!(block.facts[0], ("status".into(), "ok".into()));
         // The key, time and label fields are never repeated as facts.
-        assert!(block
-            .facts
-            .iter()
-            .all(|(k, _)| !["correlationId", "occurredAt", "eventType"].contains(&k.as_str())));
+        assert!(
+            block
+                .facts
+                .iter()
+                .all(|(k, _)| !["correlationId", "occurredAt", "eventType"].contains(&k.as_str()))
+        );
     }
 
     #[test]
@@ -936,7 +938,11 @@ mod tests {
             vec![doc_block("1", "db/events", Some("Validate"), 0)],
         )];
 
-        let out = regroup(lanes, "workflowname", &expected(&["Validate", "Invoice", "Archive"]));
+        let out = regroup(
+            lanes,
+            "workflowname",
+            &expected(&["Validate", "Invoice", "Archive"]),
+        );
         let awaiting: Vec<&str> = out
             .iter()
             .filter(|l| l.state == LaneState::Awaiting)
@@ -1065,7 +1071,12 @@ mod tests {
                 ),
                 container_lane(
                     "ais/MsgTracking",
-                    vec![schema_block("4", "ais/MsgTracking", Some("ais.pivot.event"), 11_000)],
+                    vec![schema_block(
+                        "4",
+                        "ais/MsgTracking",
+                        Some("ais.pivot.event"),
+                        11_000,
+                    )],
                 ),
                 Lane {
                     name: "ais/leases".into(),
@@ -1080,10 +1091,17 @@ mod tests {
         let out = relane(&base, "schema", &[]);
         let mut got = names(&out);
         got.sort_unstable();
-        assert_eq!(got, vec!["(no schema)", "ais.jde.invoice", "ais.pivot.event"]);
+        assert_eq!(
+            got,
+            vec!["(no schema)", "ais.jde.invoice", "ais.pivot.event"]
+        );
 
         // The same schema value seen in two containers becomes one lane.
-        let pivot = out.lanes.iter().find(|l| l.name == "ais.pivot.event").unwrap();
+        let pivot = out
+            .lanes
+            .iter()
+            .find(|l| l.name == "ais.pivot.event")
+            .unwrap();
         assert_eq!(pivot.blocks.len(), 2);
         assert_eq!(
             pivot.detail.as_deref(),

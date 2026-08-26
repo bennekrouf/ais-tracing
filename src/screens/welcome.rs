@@ -26,9 +26,18 @@ pub fn Welcome(props: WelcomeProps) -> Element {
         loading_accounts.set(true);
         spawn(async move {
             match tokio::task::spawn_blocking(az::list_cosmos_accounts).await {
-                Ok(Ok(list)) => { accounts.set(list); accounts_error.set(None); }
-                Ok(Err(e)) => { accounts.set(vec![]); accounts_error.set(Some(e)); }
-                Err(e) => { accounts.set(vec![]); accounts_error.set(Some(e.to_string())); }
+                Ok(Ok(list)) => {
+                    accounts.set(list);
+                    accounts_error.set(None);
+                }
+                Ok(Err(e)) => {
+                    accounts.set(vec![]);
+                    accounts_error.set(Some(e));
+                }
+                Err(e) => {
+                    accounts.set(vec![]);
+                    accounts_error.set(Some(e.to_string()));
+                }
             }
             loading_accounts.set(false);
         });
@@ -36,7 +45,8 @@ pub fn Welcome(props: WelcomeProps) -> Element {
 
     use_effect(move || {
         spawn(async move {
-            let state = tokio::task::spawn_blocking(az::check_login).await
+            let state = tokio::task::spawn_blocking(az::check_login)
+                .await
                 .unwrap_or(AzLoginState::NotLoggedIn);
             let is_logged_in = matches!(state, AzLoginState::LoggedIn { .. });
             az_state.set(state);
