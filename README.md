@@ -15,7 +15,7 @@ Downloads are on the [latest release](https://github.com/bennekrouf/ais-tracing/
 
 ### macOS — Apple Silicon
 
-Download [`ais-tracing-macos-arm64.dmg`](https://github.com/bennekrouf/ais-tracing/releases/latest/download/ais-tracing-macos-arm64.dmg),
+Download [`ais-tracing-macos-arm64.dmg`](https://mayorana.ch/downloads/ais-tracing/latest/ais-tracing-macos-arm64.dmg),
 open it, drag **AIS Tracing** to Applications.
 
 Signed and notarized by Apple, so it opens with a normal double-click — no
@@ -23,7 +23,7 @@ right-click-to-open, no security warning.
 
 ### Windows 10/11 — 64-bit
 
-Download [`ais-tracing-setup.exe`](https://github.com/bennekrouf/ais-tracing/releases/latest/download/ais-tracing-setup.exe)
+Download [`ais-tracing-setup.exe`](https://mayorana.ch/downloads/ais-tracing/latest/ais-tracing-setup.exe)
 and run it. The installer adds a Start menu entry, installs the Azure CLI if
 you don't have it, and offers to launch the app when it finishes.
 
@@ -33,7 +33,7 @@ code-signed yet. Choose **More info → Run anyway**.
 ### Linux — x86_64
 
 ```bash
-curl -L https://github.com/bennekrouf/ais-tracing/releases/latest/download/ais-tracing-linux-x86_64.tar.gz | tar xz
+curl -L https://mayorana.ch/downloads/ais-tracing/latest/ais-tracing-linux-x86_64.tar.gz | tar xz
 cd ais-tracing-linux-x86_64
 sudo ./setup-linux.sh
 ./ais-tracing
