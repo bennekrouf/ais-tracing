@@ -51,6 +51,10 @@ pub fn open_in_new_window(account: CosmosAccount) {
 }
 
 fn main() {
+    // Before anything can shell out: a bundle launched from Finder does not
+    // inherit the terminal's PATH, so `az` would read as "not found on PATH".
+    services::env::adopt_login_path();
+
     if std::env::var("RUST_LOG").is_err() {
         // SAFETY: single-threaded, before any other threads (e.g. tokio) start.
         unsafe {
