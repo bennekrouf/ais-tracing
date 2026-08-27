@@ -2,6 +2,7 @@
 name = "ais-tracing"
 version = "0.1.11"
 edition = "2024"
+license-file = "LICENSE"
 
 [dependencies]
 arboard = "3"
