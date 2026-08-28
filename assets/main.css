@@ -947,3 +947,22 @@ table.schema-table tr.key-row:hover td { background: rgba(255,167,38,0.16); }
     opacity: 0.7;
 }
 .update-banner-dismiss:hover { opacity: 1; }
+
+/* ── Subscriptions that could not be read ──────────────────────────────────
+   Shown whether or not anything was found. A partial scan is still partial,
+   and an empty list from subscriptions nobody could read is not an answer. */
+.skipped-list {
+    margin-top: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    text-align: left;
+}
+.skipped-row {
+    display: flex;
+    align-items: baseline;
+    gap: 7px;
+    font-size: 11px;
+}
+.skipped-name { color: var(--text2); white-space: nowrap; }
+.skipped-why { color: var(--text3); }
