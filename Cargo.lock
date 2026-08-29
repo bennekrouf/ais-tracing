@@ -28,7 +28,7 @@ dependencies = [
 
 [[package]]
 name = "ais-tracing"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "arboard",
  "azure_core",
