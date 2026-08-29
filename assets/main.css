@@ -629,8 +629,8 @@ table.schema-table tr:hover td { background: var(--bg2); }
     flex-direction: column;
     gap: 2px;
 }
-.lane-name { font-size: 12px; color: var(--text1); }
-.lane-field { font-size: 10px; color: var(--text3); }
+.lane-name { font-size: 12px; color: var(--text1); overflow-wrap: anywhere; }
+.lane-field { font-size: 10px; color: var(--text3); overflow-wrap: anywhere; }
 .lane-gap { font-size: 10px; color: var(--blue); }
 
 .lane-body { position: relative; flex: 1; }
