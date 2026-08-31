@@ -19,5 +19,12 @@ command -v rustfmt >/dev/null 2>&1 || {
     exit 0
 }
 
-printf '%s\n' "$files" | xargs rustfmt --edition 2021
+# rustfmt has to be told the edition — left alone it assumes 2015 — and it has
+# to be the crate's own. Hardcoding 2021 against an edition-2024 crate is what
+# left CI's fmt gate red for weeks: the hook rewrote files in a style
+# `cargo fmt --all --check` then rejected, on every commit. Read it from
+# Cargo.toml so the two cannot drift apart again.
+edition=$(sed -n 's/^edition = "\(.*\)"/\1/p' Cargo.toml | head -1)
+
+printf '%s\n' "$files" | xargs rustfmt --edition "${edition:-2024}"
 printf '%s\n' "$files" | xargs git add --
