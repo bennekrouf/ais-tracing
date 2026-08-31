@@ -788,10 +788,12 @@ mod tests {
         assert_eq!(block.at, Some(1_767_178_800_000));
         assert_eq!(block.facts[0], ("status".into(), "ok".into()));
         // The key, time and label fields are never repeated as facts.
-        assert!(block
-            .facts
-            .iter()
-            .all(|(k, _)| !["correlationId", "occurredAt", "eventType"].contains(&k.as_str())));
+        assert!(
+            block
+                .facts
+                .iter()
+                .all(|(k, _)| !["correlationId", "occurredAt", "eventType"].contains(&k.as_str()))
+        );
     }
 
     #[test]

@@ -22,8 +22,32 @@ fn window_config(title: &str) -> dioxus::desktop::Config {
             dioxus::desktop::WindowBuilder::new()
                 .with_title(title)
                 .with_inner_size(LogicalSize::new(1100.0, 760.0))
-                .with_always_on_top(false),
+                .with_always_on_top(false)
+                .with_window_icon(window_icon()),
         )
+}
+
+/// The window icon, decoded from the embedded logo.
+///
+/// build.rs embeds `assets/icon.ico` into the .exe resource, which covers the
+/// Start menu and shortcuts — but the *window* (title bar, alt-tab, taskbar
+/// button) shows only what the app sets at runtime, and Windows falls back to
+/// a blank default when it sets nothing. That was the whole gap against
+/// ais-runner, which sets one here.
+///
+/// Downscaled to 64px on the way in: tao hands Windows this single bitmap for
+/// every size it needs, and letting it stretch a 1024px source down to a 16px
+/// title bar is what makes the icon look muddy.
+fn window_icon() -> Option<dioxus::desktop::tao::window::Icon> {
+    const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
+    const SIZE: u32 = 64;
+
+    let img = image::load_from_memory(ICON_PNG).ok()?.resize_exact(
+        SIZE,
+        SIZE,
+        image::imageops::FilterType::Lanczos3,
+    );
+    dioxus::desktop::tao::window::Icon::from_rgba(img.into_rgba8().into_raw(), SIZE, SIZE).ok()
 }
 
 /// Opens another window on `account`, in this same process.
