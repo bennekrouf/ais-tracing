@@ -7,6 +7,47 @@ use dioxus::prelude::*;
 /// the user pick the resource to work with — here a Cosmos DB account
 /// instead of a Logic App. Connecting always opens a new window; this one
 /// stays put as the launcher.
+/// Opens `az login` and waits for it to take effect.
+///
+/// `az login` is spawned, not awaited — the sign-in happens in a browser, so
+/// the app only learns it worked by asking again. Without this poll the screen
+/// keeps saying "session expired" after a successful sign-in, with no way
+/// forward: the expired path had the button but not the waiting, so it looked
+/// broken precisely when the user had done the right thing.
+fn start_login<F>(
+    mut az_state: Signal<AzLoginState>,
+    mut checking: Signal<bool>,
+    mut login_error: Signal<Option<String>>,
+    mut load_accounts: F,
+) where
+    F: FnMut() + Copy + 'static,
+{
+    login_error.set(None);
+    match az::open_login() {
+        Ok(()) => {
+            checking.set(true);
+            spawn(async move {
+                // Two minutes: long enough for a browser sign-in with MFA,
+                // short enough that an abandoned one stops asking.
+                for _ in 0..24 {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    let state = tokio::task::spawn_blocking(az::check_login)
+                        .await
+                        .unwrap_or(AzLoginState::NotLoggedIn);
+                    let done = matches!(state, AzLoginState::LoggedIn { .. });
+                    az_state.set(state);
+                    checking.set(false);
+                    if done {
+                        load_accounts();
+                        break;
+                    }
+                }
+            });
+        }
+        Err(e) => login_error.set(Some(e)),
+    }
+}
+
 #[component]
 pub fn Welcome() -> Element {
     let mut az_state = use_signal(|| AzLoginState::AzNotFound);
@@ -98,12 +139,12 @@ pub fn Welcome() -> Element {
                                         span { "Session expired: {account}" }
                                         button {
                                             class: "btn-primary",
-                                            onclick: move |_| {
-                                                login_error.set(None);
-                                                if let Err(e) = az::open_login() {
-                                                    login_error.set(Some(e));
-                                                }
-                                            },
+                                            onclick: move |_| start_login(
+                                                az_state,
+                                                checking,
+                                                login_error,
+                                                load_accounts,
+                                            ),
                                             "Sign in again"
                                         }
                                     }
@@ -123,29 +164,12 @@ pub fn Welcome() -> Element {
                                             span { "Not signed in" }
                                             button {
                                                 class: "btn-primary",
-                                                onclick: move |_| {
-                                                    login_error.set(None);
-                                                    match az::open_login() {
-                                                        Ok(()) => {
-                                                            checking.set(true);
-                                                            spawn(async move {
-                                                                for _ in 0..24 {
-                                                                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                                                                    let state = tokio::task::spawn_blocking(az::check_login).await
-                                                                        .unwrap_or(AzLoginState::NotLoggedIn);
-                                                                    let done = matches!(state, AzLoginState::LoggedIn { .. });
-                                                                    az_state.set(state);
-                                                                    checking.set(false);
-                                                                    if done {
-                                                                        load_accounts();
-                                                                        break;
-                                                                    }
-                                                                }
-                                                            });
-                                                        }
-                                                        Err(e) => login_error.set(Some(e)),
-                                                    }
-                                                },
+                                                onclick: move |_| start_login(
+                                                    az_state,
+                                                    checking,
+                                                    login_error,
+                                                    load_accounts,
+                                                ),
                                                 "Connect to Azure"
                                             }
                                         }
