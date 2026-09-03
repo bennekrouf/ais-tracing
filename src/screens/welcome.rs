@@ -115,7 +115,7 @@ pub fn Welcome() -> Element {
     rsx! {
         div { class: "welcome",
             div { class: "welcome-card",
-                h1 { "ais-tracing" }
+                h1 { "AIS Tracing" }
                 p { class: "subtitle", "Azure Cosmos DB — correlation-key flow explorer" }
 
                 div { class: "welcome-box",

@@ -260,7 +260,7 @@ pub fn Home(props: HomeProps) -> Element {
                 onclick: move |_| props.on_back.call(()),
                 "‹ Back"
             }
-            h1 { "ais-tracing" }
+            h1 { "AIS Tracing" }
             span { class: "account-tag", "{account.name}  ({account.resource_group})" }
 
             div { class: "topbar-tabs",
