@@ -67,7 +67,7 @@ pub fn open_in_new_window(account: CosmosAccount) {
     dioxus::desktop::window().new_window(
         dom,
         window_config(&format!(
-            "ais-tracing {} — {}",
+            "AIS Tracing {} — {}",
             env!("CARGO_PKG_VERSION"),
             name
         )),
@@ -86,7 +86,7 @@ fn main() {
         }
     }
 
-    let cfg = window_config(concat!("ais-tracing ", env!("CARGO_PKG_VERSION")));
+    let cfg = window_config(concat!("AIS Tracing ", env!("CARGO_PKG_VERSION")));
     dioxus::LaunchBuilder::desktop().with_cfg(cfg).launch(App);
 }
 
@@ -142,7 +142,7 @@ fn WindowRoot(initial: Option<CosmosAccount>) -> Element {
         if let (Some(info), false) = (update_info.read().clone(), *update_dismissed.read()) {
             div { class: "update-banner",
                 span { class: "update-banner-text",
-                    "ais-tracing "
+                    "AIS Tracing "
                     strong { "{info.latest_version}" }
                     " is available (you have {env!(\"CARGO_PKG_VERSION\")})."
                 }
