@@ -56,12 +56,8 @@ fn read() -> Store {
 }
 
 fn write(store: &Store) {
-    let path = path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
     if let Ok(json) = serde_json::to_string_pretty(store) {
-        let _ = std::fs::write(path, json);
+        crate::services::atomic_write(&path(), &json);
     }
 }
 

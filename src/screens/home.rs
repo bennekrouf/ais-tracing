@@ -16,7 +16,9 @@ enum LoadState {
     Idle,
     Loading,
     Done,
-    Failed(String),
+    /// Nothing could be sampled at all. Individual containers that failed are
+    /// in `scan_errors` instead — the scan still succeeded around them.
+    Failed(cosmos::DataError),
 }
 
 #[derive(Props, Clone, PartialEq)]
@@ -40,6 +42,9 @@ pub fn Home(props: HomeProps) -> Element {
     let mut refreshing = use_signal(|| false);
     let mut refresh_error = use_signal(|| Option::<String>::None);
     let mut scanned_at = use_signal(|| Option::<i64>::None);
+    // Containers the scan could not read. Kept apart from `LoadState::Failed`:
+    // these are gaps in an otherwise usable account, not a failed scan.
+    let mut scan_errors = use_signal(Vec::<cosmos::ContainerError>::new);
 
     // What the user is tracing on: the key that links steps, the field that
     // orders them, the field that names them.
@@ -62,6 +67,11 @@ pub fn Home(props: HomeProps) -> Element {
     });
 
     let insights = use_memo(move || discover::analyze(&schemas.read()));
+    // Every scalar field in the account, for the error-rule picker. Recomputed
+    // with the scan rather than on every render — the picker has a filter box,
+    // and rebuilding the whole list per keystroke is the one thing it must not
+    // do.
+    let scalar_fields = use_memo(move || discover::scalar_fields(&schemas.read()));
 
     // `background` means we already have cached schemas on screen: refresh
     // without blanking them, and keep them if the refresh fails.
@@ -76,24 +86,55 @@ pub fn Home(props: HomeProps) -> Element {
             refreshing.set(true);
             refresh_error.set(None);
             spawn(async move {
-                match scan_account(&account.endpoint).await {
+                match cosmos::scan_account(&account.endpoint).await {
                     Ok(found) => {
-                        cache::save(&account.endpoint, &found);
+                        cache::save(&account.endpoint, &found.schemas);
                         scanned_at.set(Some(chrono::Utc::now().timestamp()));
-                        schemas.set(found);
+                        scan_errors.set(found.errors);
+                        schemas.set(found.schemas);
                         state.set(LoadState::Done);
                     }
                     Err(e) => {
                         if background {
                             // Cached data is still on screen and still useful;
                             // say the refresh failed rather than discarding it.
-                            refresh_error.set(Some(e));
+                            refresh_error.set(Some(e.message));
                         } else {
                             state.set(LoadState::Failed(e));
                         }
                     }
                 }
                 refreshing.set(false);
+            });
+        }
+    };
+
+    // Granting Data Reader, shared by the two places that offer it: the
+    // screen shown when nothing could be read at all, and the panel listing
+    // individual containers that were refused.
+    let grant_reader = {
+        let account = account.clone();
+        let run_scan = run_scan.clone();
+        move |_| {
+            let account = account.clone();
+            let mut run_scan = run_scan.clone();
+            granting.set(true);
+            spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::services::az::grant_self_cosmos_data_reader(&account)
+                })
+                .await;
+                granting.set(false);
+                match result {
+                    Ok(Ok(())) => {
+                        // The assignment takes a moment to propagate before a
+                        // fresh query sees it.
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        run_scan(true);
+                    }
+                    Ok(Err(e)) => refresh_error.set(Some(format!("Grant failed: {e}"))),
+                    Err(e) => refresh_error.set(Some(format!("Grant failed: {e}"))),
+                }
             });
         }
     };
@@ -209,7 +250,11 @@ pub fn Home(props: HomeProps) -> Element {
         }
     });
 
-    let is_forbidden = matches!(&*state.read(), LoadState::Failed(e) if e.contains("403"));
+    // Whether to offer the role grant: either the whole scan was refused, or
+    // individual containers were. The status code decides it — matching on
+    // the rendered message caught any error whose text mentioned the number.
+    let is_forbidden = matches!(&*state.read(), LoadState::Failed(e) if e.forbidden())
+        || scan_errors.read().iter().any(|e| e.forbidden);
 
     let on_setup = *tab.read() == Tab::Setup;
 
@@ -329,10 +374,10 @@ pub fn Home(props: HomeProps) -> Element {
                     div { class: "panel", "Sampling containers..." }
                 },
                 LoadState::Failed(e) => {
-                    let e = e.clone();
+                    let message = e.message.clone();
                     rsx! {
                         div { class: "panel",
-                            div { class: "az-error", "Scan failed: {e}" }
+                            div { class: "az-error", "Scan failed: {message}" }
                             if is_forbidden {
                                 p { style: "font-size:12px; color:var(--text2); margin-top:8px;",
                                     "Cosmos data-plane access is governed by a separate SQL role assignment from ARM RBAC. "
@@ -342,29 +387,7 @@ pub fn Home(props: HomeProps) -> Element {
                                     class: "btn",
                                     style: "margin-top:8px;",
                                     disabled: *granting.read(),
-                                    onclick: {
-                                        let account = account.clone();
-                                        let run_scan = run_scan.clone();
-                                        move |_| {
-                                            let account = account.clone();
-                                            let mut run_scan = run_scan.clone();
-                                            granting.set(true);
-                                            spawn(async move {
-                                                let result = tokio::task::spawn_blocking(move || {
-                                                    crate::services::az::grant_self_cosmos_data_reader(&account)
-                                                }).await;
-                                                granting.set(false);
-                                                match result {
-                                                    Ok(Ok(())) => {
-                                                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                                                        run_scan(true);
-                                                    }
-                                                    Ok(Err(e)) => state.set(LoadState::Failed(format!("Grant failed: {e}"))),
-                                                    Err(e) => state.set(LoadState::Failed(format!("Grant failed: {e}"))),
-                                                }
-                                            });
-                                        }
-                                    },
+                                    onclick: grant_reader,
                                     if *granting.read() { "Granting..." } else { "Grant myself Data Reader" }
                                 }
                             }
@@ -372,18 +395,29 @@ pub fn Home(props: HomeProps) -> Element {
                     }
                 },
                 LoadState::Done => {
-                    let insights = insights.read().clone();
                     let key = insights
+                        .read()
                         .keys
                         .iter()
                         .find(|c| c.id == *key_id.read())
                         .cloned();
                     rsx! {
                         div {
+                            // Containers the scan could not read. Shown on both
+                            // tabs: a gap here changes what every lane means.
+                            if !scan_errors.read().is_empty() {
+                                SkippedContainers {
+                                    errors: scan_errors,
+                                    granting: *granting.read(),
+                                    on_grant: grant_reader,
+                                    offer_grant: is_forbidden,
+                                }
+                            }
+
                             if on_setup {
                                 if !schemas.read().is_empty() {
                                     TraceSetup {
-                                        insights: insights.clone(),
+                                        insights,
                                         trace_key: key.clone(),
                                         time_id: time_id.read().clone(),
                                         label_id: label_id.read().clone(),
@@ -396,8 +430,8 @@ pub fn Home(props: HomeProps) -> Element {
                                 }
 
                                 ErrorRules {
-                                    fields: discover::scalar_fields(&schemas.read()),
-                                    schemas: schemas.read().clone(),
+                                    fields: scalar_fields,
+                                    schemas,
                                     rules: rules.read().clone(),
                                     on_change: {
                                         let endpoint = account.endpoint.clone();
@@ -409,7 +443,7 @@ pub fn Home(props: HomeProps) -> Element {
                                 }
 
                                 ContainerList {
-                                    schemas: schemas.read().clone(),
+                                    schemas,
                                     trace_key: key.clone(),
                                 }
                             } else if let Some(key) = key.clone() {
@@ -555,7 +589,10 @@ fn reconcile<'a>(selection: &mut Signal<String>, mut options: impl Iterator<Item
 
 #[derive(Props, Clone, PartialEq)]
 struct TraceSetupProps {
-    insights: discover::Insights,
+    /// The memo itself, not a copy of it: `Insights` carries every candidate,
+    /// binding and piece of evidence in the account, and cloning that on every
+    /// render was pure waste.
+    insights: Memo<discover::Insights>,
     trace_key: Option<discover::KeyCandidate>,
     time_id: String,
     label_id: String,
@@ -571,7 +608,8 @@ struct TraceSetupProps {
 /// this reads the same on any schema.
 #[component]
 fn TraceSetup(props: TraceSetupProps) -> Element {
-    let total = props.insights.containers.len();
+    let insights = props.insights.read();
+    let total = insights.containers.len();
     let key = props.trace_key.clone();
     let no_key = key.is_none();
 
@@ -588,7 +626,7 @@ fn TraceSetup(props: TraceSetupProps) -> Element {
                     select {
                         onchange: move |evt| props.on_key.call(evt.value()),
                         option { value: "", selected: no_key, "-- choose a field --" }
-                        for c in props.insights.keys.iter() {
+                        for c in insights.keys.iter() {
                             option {
                                 value: "{c.id}",
                                 selected: key.as_ref().is_some_and(|k| k.id == c.id),
@@ -609,7 +647,7 @@ fn TraceSetup(props: TraceSetupProps) -> Element {
                     select {
                         onchange: move |evt| props.on_time.call(evt.value()),
                         option { value: "", selected: props.time_id.is_empty(), "-- none --" }
-                        for c in props.insights.times.iter() {
+                        for c in insights.times.iter() {
                             option {
                                 value: "{c.id}",
                                 selected: props.time_id == c.id,
@@ -628,7 +666,7 @@ fn TraceSetup(props: TraceSetupProps) -> Element {
                             selected: props.lane_id.is_empty(),
                             "Cosmos container (default)"
                         }
-                        for c in props.insights.labels.iter() {
+                        for c in insights.labels.iter() {
                             option {
                                 value: "{c.id}",
                                 selected: props.lane_id == c.id,
@@ -643,7 +681,7 @@ fn TraceSetup(props: TraceSetupProps) -> Element {
                     select {
                         onchange: move |evt| props.on_label.call(evt.value()),
                         option { value: "", selected: props.label_id.is_empty(), "-- none --" }
-                        for c in props.insights.labels.iter() {
+                        for c in insights.labels.iter() {
                             option {
                                 value: "{c.id}",
                                 selected: props.label_id == c.id,
@@ -683,6 +721,58 @@ fn TraceSetup(props: TraceSetupProps) -> Element {
                         "Nothing in the sample linked containers on its own."
                     }
                 },
+            }
+        }
+    }
+}
+
+#[derive(Props, Clone, PartialEq)]
+struct SkippedContainersProps {
+    errors: Signal<Vec<cosmos::ContainerError>>,
+    granting: bool,
+    offer_grant: bool,
+    on_grant: EventHandler<MouseEvent>,
+}
+
+/// Containers the scan could not read.
+///
+/// This has to be on screen, not in a log. Every lane state downstream is a
+/// claim about the account — `awaiting` says the data has not arrived,
+/// `off-path` says the key does not live there — and both are only true of
+/// containers that were actually sampled. A container that was skipped
+/// silently turns every one of those claims into a guess.
+#[component]
+fn SkippedContainers(props: SkippedContainersProps) -> Element {
+    let errors = props.errors.read();
+    rsx! {
+        div { class: "panel",
+            div { class: "panel-head",
+                h3 { "Not sampled" }
+                span { class: "chip warn", "{errors.len()} container(s)" }
+            }
+            p { class: "meta",
+                "These could not be read, so nothing below says anything about them."
+            }
+            div { class: "skipped-list",
+                for e in errors.iter() {
+                    div { class: "skipped-row",
+                        span { class: "dot error" }
+                        span { class: "skipped-name", "{e.path}" }
+                        span { class: "skipped-why", "{e.message}" }
+                    }
+                }
+            }
+            if props.offer_grant {
+                p { style: "font-size:12px; color:var(--text2); margin-top:8px;",
+                    "Cosmos data-plane access is a separate SQL role assignment from ARM RBAC."
+                }
+                button {
+                    class: "btn",
+                    style: "margin-top:8px;",
+                    disabled: props.granting,
+                    onclick: move |e| props.on_grant.call(e),
+                    if props.granting { "Granting..." } else { "Grant myself Data Reader" }
+                }
             }
         }
     }
@@ -734,17 +824,15 @@ fn DocPanel(props: DocPanelProps) -> Element {
                         move |_| {
                             // Best-effort: a clipboard we can't reach is not
                             // worth interrupting the user over.
-                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                if clipboard.set_text(pretty.clone()).is_ok() {
-                                    copied.set(true);
-                                    spawn(async move {
-                                        tokio::time::sleep(
-                                            std::time::Duration::from_millis(1400),
-                                        )
+                            if let Ok(mut clipboard) = arboard::Clipboard::new()
+                                && clipboard.set_text(pretty.clone()).is_ok()
+                            {
+                                copied.set(true);
+                                spawn(async move {
+                                    tokio::time::sleep(std::time::Duration::from_millis(1400))
                                         .await;
-                                        copied.set(false);
-                                    });
-                                }
+                                    copied.set(false);
+                                });
                             }
                         }
                     },
@@ -893,8 +981,8 @@ fn shorten(value: &str) -> String {
 
 #[derive(Props, Clone, PartialEq)]
 struct ErrorRulesProps {
-    fields: Vec<discover::RoleCandidate>,
-    schemas: Vec<cosmos::ContainerSchema>,
+    fields: Memo<Vec<discover::RoleCandidate>>,
+    schemas: Signal<Vec<cosmos::ContainerSchema>>,
     rules: Vec<trace::ErrorRule>,
     on_change: EventHandler<Vec<trace::ErrorRule>>,
 }
@@ -909,6 +997,8 @@ fn ErrorRules(props: ErrorRulesProps) -> Element {
     let mut field = use_signal(String::new);
     let mut value = use_signal(String::new);
     let mut filter = use_signal(String::new);
+    // Why the last Add did nothing, when it did nothing.
+    let mut note = use_signal(String::new);
 
     let chosen = field.read().clone();
 
@@ -916,8 +1006,8 @@ fn ErrorRules(props: ErrorRulesProps) -> Element {
     // alphabetical dropdown useless for finding one you can already name.
     // Ids are stored lowercased, so the needle matches directly.
     let needle = filter.read().trim().to_lowercase();
-    let matches: Vec<&discover::RoleCandidate> = props
-        .fields
+    let fields = props.fields.read();
+    let matches: Vec<&discover::RoleCandidate> = fields
         .iter()
         // The chosen field always stays in the list: if filtering could drop
         // it, the select would silently fall back to its first option and
@@ -926,9 +1016,8 @@ fn ErrorRules(props: ErrorRulesProps) -> Element {
         .collect();
     // The values actually sampled for the chosen field, so the common case is
     // clicking one rather than remembering what the codes are.
-    let observed = discover::field_values(&props.schemas, &chosen);
-    let label = props
-        .fields
+    let observed = discover::field_values(&props.schemas.read(), &chosen);
+    let label = fields
         .iter()
         .find(|f| f.id == chosen)
         .map(|f| f.label.clone())
@@ -1002,6 +1091,7 @@ fn ErrorRules(props: ErrorRulesProps) -> Element {
                                     move |_| {
                                         field.set(id.clone());
                                         value.set(String::new());
+                                        note.set(String::new());
                                     }
                                 },
                                 span { class: "field-option-name", "{f.label}" }
@@ -1011,9 +1101,9 @@ fn ErrorRules(props: ErrorRulesProps) -> Element {
                     }
                     span { class: "meta",
                         if needle.is_empty() {
-                            "{props.fields.len()} fields"
+                            "{fields.len()} fields"
                         } else {
-                            "{matches.len()} of {props.fields.len()} fields"
+                            "{matches.len()} of {fields.len()} fields"
                         }
                     }
                 }
@@ -1034,7 +1124,14 @@ fn ErrorRules(props: ErrorRulesProps) -> Element {
                             let (current, label) = (current.clone(), label.clone());
                             move |e: KeyboardEvent| {
                                 if e.key() == Key::Enter && ready {
-                                    commit(&current, &mut field, &mut value, &label, on_change);
+                                    commit(
+                                        &current,
+                                        &mut field,
+                                        &mut value,
+                                        &label,
+                                        on_change,
+                                        &mut note,
+                                    );
                                 }
                             }
                         },
@@ -1045,9 +1142,14 @@ fn ErrorRules(props: ErrorRulesProps) -> Element {
                     disabled: !ready,
                     onclick: {
                         let (current, label) = (current.clone(), label.clone());
-                        move |_| commit(&current, &mut field, &mut value, &label, on_change)
+                        move |_| {
+                            commit(&current, &mut field, &mut value, &label, on_change, &mut note)
+                        }
                     },
                     "Add rule"
+                }
+                if !note.read().is_empty() {
+                    span { class: "meta", "{note}" }
                 }
             }
 
@@ -1078,6 +1180,7 @@ fn commit(
     value: &mut Signal<String>,
     display: &str,
     on_change: EventHandler<Vec<trace::ErrorRule>>,
+    note: &mut Signal<String>,
 ) {
     let field_id = field.peek().clone();
     let text = value.peek().trim().to_string();
@@ -1089,17 +1192,22 @@ fn commit(
         display: display.to_string(),
         value: text,
     };
-    if !current.contains(&rule) {
-        let mut next = current.to_vec();
-        next.push(rule);
-        on_change.call(next);
+    // A duplicate used to be dropped while the box was cleared anyway, which
+    // looks exactly like the rule being added. Say what happened instead.
+    if current.contains(&rule) {
+        note.set(format!("{} is already a rule.", rule.label()));
+        return;
     }
+    note.set(String::new());
+    let mut next = current.to_vec();
+    next.push(rule);
+    on_change.call(next);
     value.set(String::new());
 }
 
 #[derive(Props, Clone, PartialEq)]
 struct ContainerListProps {
-    schemas: Vec<cosmos::ContainerSchema>,
+    schemas: Signal<Vec<cosmos::ContainerSchema>>,
     trace_key: Option<discover::KeyCandidate>,
 }
 
@@ -1109,14 +1217,11 @@ struct ContainerListProps {
 #[component]
 fn ContainerList(props: ContainerListProps) -> Element {
     let mut open = use_signal(BTreeSet::<String>::new);
-    let paths: Vec<String> = props
-        .schemas
-        .iter()
-        .map(cosmos::ContainerSchema::path)
-        .collect();
+    let schemas = props.schemas.read();
+    let paths: Vec<String> = schemas.iter().map(cosmos::ContainerSchema::path).collect();
     let all_open = !paths.is_empty() && paths.iter().all(|p| open.read().contains(p));
 
-    if props.schemas.is_empty() {
+    if schemas.is_empty() {
         return rsx! {
             div { class: "panel", "No databases/containers found in this account." }
         };
@@ -1126,7 +1231,7 @@ fn ContainerList(props: ContainerListProps) -> Element {
         div { class: "panel",
             div { class: "panel-head",
                 h3 { "Containers" }
-                span { class: "chip muted", "{props.schemas.len()} sampled" }
+                span { class: "chip muted", "{schemas.len()} sampled" }
                 div { class: "spacer" }
                 button {
                     class: "btn",
@@ -1142,7 +1247,7 @@ fn ContainerList(props: ContainerListProps) -> Element {
             }
 
             div { class: "container-list",
-                for s in props.schemas.iter() {
+                for s in schemas.iter() {
                     ContainerRow {
                         schema: s.clone(),
                         trace_key: props.trace_key.clone(),
@@ -1250,19 +1355,4 @@ mod tests {
         let value = "→".repeat(40);
         assert_eq!(shorten(&value).chars().count(), 17);
     }
-}
-
-async fn scan_account(endpoint: &str) -> Result<Vec<cosmos::ContainerSchema>, String> {
-    // One client for the whole scan — see `cosmos::connect`.
-    let client = cosmos::connect(endpoint).await?;
-    let databases = cosmos::list_databases(&client).await?;
-    let mut out = Vec::new();
-    for db in databases {
-        let containers = cosmos::list_containers(&client, &db).await?;
-        for container in containers {
-            let schema = cosmos::infer_container_schema(&client, &db, &container).await?;
-            out.push(schema);
-        }
-    }
-    Ok(out)
 }

@@ -36,7 +36,7 @@ struct Platforms {
     linux: HashMap<String, Artifact>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct Artifact {
     url: String,
     #[allow(dead_code)]
@@ -84,8 +84,21 @@ pub async fn check() -> Option<UpdateInfo> {
     }
 }
 
-/// Picks the one artifact URL published for this OS. Empty (build missing
-/// for this OS) or unparseable falls back to the landing page.
+/// Architecture spellings that appear in artifact names, and which machine
+/// each belongs to.
+const ARCH_TOKENS: [(&str, &[&str]); 2] = [
+    ("aarch64", &["aarch64", "arm64"]),
+    ("x86_64", &["x86_64", "x86-64", "amd64", "x64"]),
+];
+
+/// Picks the artifact published for this machine. Anything ambiguous falls
+/// back to the landing page, where the user can choose.
+///
+/// The previous version took `values().next()` off a `HashMap`, which is
+/// unordered — correct only by accident, while every OS happened to publish
+/// exactly one build. The moment a second architecture ships (an Intel dmg,
+/// an arm64 tarball) that hands out a random one, which is the case the
+/// landing-page fallback exists for in the first place.
 fn platform_url(platforms: &Platforms) -> String {
     let by_os = match std::env::consts::OS {
         "macos" => &platforms.macos,
@@ -93,17 +106,49 @@ fn platform_url(platforms: &Platforms) -> String {
         "linux" => &platforms.linux,
         _ => return RELEASES_URL.to_string(),
     };
-    by_os
-        .values()
-        .next()
-        .map(|a| a.url.clone())
-        .filter(|u| !u.is_empty())
+
+    // Sorted, so the same release always resolves to the same URL.
+    let mut entries: Vec<(&str, &str)> = by_os
+        .iter()
+        .filter(|(_, a)| !a.url.is_empty())
+        .map(|(k, a)| (k.as_str(), a.url.as_str()))
+        .collect();
+    entries.sort_unstable();
+
+    let mine: &[&str] = ARCH_TOKENS
+        .iter()
+        .find(|(arch, _)| *arch == std::env::consts::ARCH)
+        .map(|(_, tokens)| *tokens)
+        .unwrap_or(&[]);
+    let names_arch = |token_set: &[&str], key: &str, url: &str| {
+        let haystack = format!("{key} {url}").to_lowercase();
+        token_set.iter().any(|t| haystack.contains(t))
+    };
+
+    let chosen = entries
+        .iter()
+        .find(|(key, url)| names_arch(mine, key, url))
+        // Nothing names an architecture at all — this OS ships one build for
+        // every machine (Windows), so the single entry is it. But if some
+        // entry *does* name one and none of them is ours, we are an Intel Mac
+        // looking at an Apple Silicon dmg: say nothing rather than hand over a
+        // binary that will not run.
+        .or_else(|| {
+            let any_named = entries.iter().any(|(key, url)| {
+                ARCH_TOKENS
+                    .iter()
+                    .any(|(_, tokens)| names_arch(tokens, key, url))
+            });
+            (!any_named && entries.len() == 1).then(|| &entries[0])
+        });
+
+    chosen
         // Marks the hit as coming from an existing install. The banner opens
         // this in the user's browser, so the updater's own User-Agent is not
         // what fetches the file — without the marker the request is
         // indistinguishable from a first-time download off the website.
         // nginx serves the file regardless of the query string.
-        .map(|u| format!("{u}?src=updater"))
+        .map(|(_, url)| format!("{url}?src=updater"))
         .unwrap_or_else(|| RELEASES_URL.to_string())
 }
 
@@ -112,16 +157,97 @@ fn is_newer(a: &str, b: &str) -> bool {
         let mut parts = s.trim_start_matches('v').split('.');
         let major = parts.next()?.parse().ok()?;
         let minor = parts.next()?.parse().ok()?;
-        let patch = parts
-            .next()?
-            .split(|c: char| c == '-' || c == '+')
-            .next()?
-            .parse()
-            .ok()?;
+        let patch = parts.next()?.split(['-', '+']).next()?.parse().ok()?;
         Some((major, minor, patch))
     };
     match (parse(a), parse(b)) {
         (Some(av), Some(bv)) => av > bv,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn artifact(url: &str) -> Artifact {
+        Artifact {
+            url: url.into(),
+            sha256: String::new(),
+        }
+    }
+
+    fn platforms(entries: &[(&str, &str)]) -> Platforms {
+        let map: HashMap<String, Artifact> = entries
+            .iter()
+            .map(|(k, u)| (k.to_string(), artifact(u)))
+            .collect();
+        Platforms {
+            macos: map.clone(),
+            windows: map.clone(),
+            linux: map,
+        }
+    }
+
+    /// One build for every machine — Windows publishes a single installer with
+    /// no architecture in its name, and that is the one to hand over.
+    #[test]
+    fn a_single_architecture_less_build_is_used_as_is() {
+        let url = platform_url(&platforms(&[(
+            "exe_or_msi",
+            "https://x/ais-tracing-setup.exe",
+        )]));
+        assert_eq!(url, "https://x/ais-tracing-setup.exe?src=updater");
+    }
+
+    /// The failure this replaces: `values().next()` on a `HashMap` handed out
+    /// whichever build hashing happened to put first.
+    #[test]
+    fn the_build_for_this_machine_is_chosen_not_an_arbitrary_one() {
+        let url = platform_url(&platforms(&[
+            ("arm", "https://x/ais-tracing-macos-arm64.dmg"),
+            ("intel", "https://x/ais-tracing-macos-x86_64.dmg"),
+        ]));
+        let expected = match std::env::consts::ARCH {
+            "aarch64" => "https://x/ais-tracing-macos-arm64.dmg?src=updater",
+            _ => "https://x/ais-tracing-macos-x86_64.dmg?src=updater",
+        };
+        assert_eq!(url, expected);
+    }
+
+    /// An Intel Mac looking at an Apple-Silicon-only release. Sending it to
+    /// the landing page is the point: the alternative is a download that
+    /// cannot run.
+    #[test]
+    fn a_release_with_no_build_for_this_machine_falls_back_to_the_site() {
+        let other = match std::env::consts::ARCH {
+            "aarch64" => "https://x/ais-tracing-linux-x86_64.tar.gz",
+            _ => "https://x/ais-tracing-macos-arm64.dmg",
+        };
+        assert_eq!(platform_url(&platforms(&[("only", other)])), RELEASES_URL);
+    }
+
+    /// Two calls on the same release must agree — the banner is rendered
+    /// repeatedly, and a link that changes under the cursor is its own bug.
+    #[test]
+    fn the_same_release_always_resolves_to_the_same_url() {
+        let p = platforms(&[
+            ("a", "https://x/one.tar.gz"),
+            ("b", "https://x/two.tar.gz"),
+            ("c", "https://x/three.tar.gz"),
+        ]);
+        assert_eq!(platform_url(&p), platform_url(&p));
+    }
+
+    #[test]
+    fn versions_compare_numerically_and_tolerate_prereleases() {
+        assert!(is_newer("0.1.22", "0.1.21"));
+        assert!(is_newer("0.2.0", "0.1.99"));
+        assert!(!is_newer("0.1.21", "0.1.21"));
+        assert!(!is_newer("0.1.20", "0.1.21"));
+        assert!(is_newer("v0.1.22", "0.1.21"));
+        assert!(!is_newer("0.1.22-rc1", "0.1.22"));
+        // Anything unparseable must never claim an update is available.
+        assert!(!is_newer("not-a-version", "0.1.21"));
     }
 }

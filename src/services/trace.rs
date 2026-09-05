@@ -20,12 +20,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Per container. A single flow producing more than this is pathological.
+/// Per container. A single flow producing more than this is pathological —
+/// but hitting it is reported rather than hidden, see [`Lane::truncated`].
 const MAX_BLOCKS: usize = 200;
 /// Facts shown on a block card before it stops being "essential data".
 const MAX_FACTS: usize = 3;
 
-const SYSTEM_FIELDS: [&str; 6] = ["_rid", "_self", "_etag", "_attachments", "_ts", "_lsn"];
+use crate::services::cosmos::SYSTEM_FIELDS;
 
 /// What to trace, and how to read each document once found.
 #[derive(Clone, Debug, PartialEq)]
@@ -60,7 +61,7 @@ impl ErrorRule {
     /// `sessionStatus = 3`, for display.
     pub fn label(&self) -> String {
         let name = if self.display.is_empty() {
-            leaf(&self.field)
+            cosmos::leaf(&self.field)
         } else {
             self.display.clone()
         };
@@ -108,7 +109,11 @@ pub enum LaneState {
     /// The key doesn't exist in this container at all: it isn't on this path,
     /// so its emptiness means nothing.
     OffPath,
-    Failed(u8),
+    /// The query could not be run, so nothing is known either way. The reason
+    /// is in [`Lane::error`]; the variant carries no payload, because one that
+    /// was compared by value (`== Failed(0)`) would stop matching the moment
+    /// anyone constructed a different one.
+    Failed,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -121,6 +126,10 @@ pub struct Lane {
     pub blocks: Vec<Block>,
     pub state: LaneState,
     pub error: Option<String>,
+    /// More documents carry this value than were fetched. The lane shows the
+    /// first `MAX_BLOCKS`, and says so — a partial answer presented as a whole
+    /// one is the one thing a tracing tool must never do.
+    pub truncated: bool,
 }
 
 impl Lane {
@@ -143,6 +152,13 @@ pub struct Trace {
     /// than one means the fragment is ambiguous and the timeline would be
     /// mixing unrelated flows.
     pub matches: Vec<(String, usize)>,
+}
+
+impl Trace {
+    /// Any lane that showed only the first `MAX_BLOCKS` of its documents.
+    pub fn truncated_lanes(&self) -> usize {
+        self.lanes.iter().filter(|l| l.truncated).count()
+    }
 }
 
 impl Trace {
@@ -193,7 +209,9 @@ pub async fn suggest(
     if fragment.len() < MIN_FRAGMENT {
         return Vec::new();
     }
-    let Ok(client) = cosmos::connect(endpoint).await else {
+    // The shared client, not a fresh one: this runs per debounced keystroke,
+    // and `connect` resolves credentials.
+    let Ok(client) = cosmos::client_for(endpoint).await else {
         return Vec::new();
     };
 
@@ -216,10 +234,14 @@ pub async fn suggest(
         };
 
         // A container that can't be read shouldn't silence the others.
-        if let Ok(values) =
+        if let Ok(page) =
             cosmos::query_documents(&client, database, container, query, MAX_SUGGESTIONS).await
         {
-            found.extend(values.iter().filter_map(|v| v.as_str().map(str::to_string)));
+            found.extend(
+                page.docs
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string)),
+            );
         }
         if found.len() >= MAX_SUGGESTIONS {
             break;
@@ -234,7 +256,7 @@ pub async fn suggest(
 pub async fn run(endpoint: &str, containers: &[String], spec: &TraceSpec) -> Trace {
     // One client for every container — rebuilding it per query re-resolved
     // credentials each time and dominated the wait.
-    let client = match cosmos::connect(endpoint).await {
+    let client = match cosmos::client_for(endpoint).await {
         Ok(client) => client,
         Err(e) => {
             return Trace {
@@ -250,8 +272,9 @@ pub async fn run(endpoint: &str, containers: &[String], spec: &TraceSpec) -> Tra
                         name: path.clone(),
                         detail: None,
                         blocks: Vec::new(),
-                        state: LaneState::Failed(0),
-                        error: Some(e.clone()),
+                        state: LaneState::Failed,
+                        error: Some(e.message.clone()),
+                        truncated: false,
                     })
                     .collect(),
             };
@@ -262,7 +285,13 @@ pub async fn run(endpoint: &str, containers: &[String], spec: &TraceSpec) -> Tra
     // Only when nothing carries that value do we fall back to scanning for it
     // as a fragment, which lets a user paste the first block of a uuid.
     let exact = fetch(&client, containers, spec, false).await;
-    if exact.blocks_found > 0 || spec.value.trim().is_empty() {
+    if exact.blocks_found > 0 {
+        return exact;
+    }
+    // The fallback is an unindexed CONTAINS across every container, so it is
+    // held to the same floor as the type-ahead. Below it almost everything
+    // matches and the scan is spent for nothing.
+    if spec.value.trim().len() < MIN_FRAGMENT {
         return exact;
     }
     let fragment = fetch(&client, containers, spec, true).await;
@@ -293,14 +322,35 @@ async fn fetch(
                 blocks: Vec::new(),
                 state: LaneState::OffPath,
                 error: None,
+                truncated: false,
             });
             continue;
         };
 
-        let query = build_query(&binding.field, &spec.value, partial);
+        // A lane we could not even build a query for is a failed lane, not an
+        // empty one. Anything else reports a bug here as "the data has not
+        // arrived yet", which is a different — and wrong — answer.
+        let failed = |error: String| Lane {
+            name: path.clone(),
+            detail: Some(binding.field.clone()),
+            blocks: Vec::new(),
+            state: LaneState::Failed,
+            error: Some(error),
+            truncated: false,
+        };
+
+        let query = match build_query(&binding.field, &spec.value, partial) {
+            Ok(query) => query,
+            Err(e) => {
+                lanes.push(failed(e));
+                continue;
+            }
+        };
+
         match cosmos::query_documents(client, database, container, query, MAX_BLOCKS).await {
-            Ok(docs) => {
-                let mut blocks: Vec<Block> = docs
+            Ok(page) => {
+                let mut blocks: Vec<Block> = page
+                    .docs
                     .iter()
                     .enumerate()
                     .map(|(i, doc)| {
@@ -319,15 +369,10 @@ async fn fetch(
                     blocks,
                     state,
                     error: None,
+                    truncated: page.truncated,
                 });
             }
-            Err(e) => lanes.push(Lane {
-                name: path.clone(),
-                detail: Some(binding.field.clone()),
-                blocks: Vec::new(),
-                state: LaneState::Failed(0),
-                error: Some(e),
-            }),
+            Err(e) => lanes.push(failed(e.message)),
         }
     }
 
@@ -377,7 +422,7 @@ fn sort_lanes(lanes: &mut [Lane]) {
         let rank = |l: &Lane| match l.state {
             LaneState::Reached => 0,
             LaneState::Awaiting => 1,
-            LaneState::Failed(_) => 2,
+            LaneState::Failed => 2,
             LaneState::OffPath => 3,
         };
         rank(a)
@@ -414,12 +459,17 @@ pub fn relane(base: &Trace, lane_field: &str, expected_lanes: &[String]) -> Trac
 /// Containers whose query failed stay as their own lanes — an error must not
 /// be silently folded into "nothing here".
 fn regroup(container_lanes: Vec<Lane>, lane_field: &str, expected_lanes: &[String]) -> Vec<Lane> {
-    let unlabelled = format!("(no {})", leaf(lane_field));
+    let unlabelled = format!("(no {})", cosmos::leaf(lane_field));
     let mut grouped: BTreeMap<String, Vec<Block>> = BTreeMap::new();
     let mut failed = Vec::new();
 
+    // A lane that only showed part of its documents taints every stage its
+    // documents landed in — the regrouped lanes cannot claim to be complete
+    // when their source was not.
+    let truncated = container_lanes.iter().any(|l| l.truncated);
+
     for lane in container_lanes {
-        if lane.state == LaneState::Failed(0) {
+        if lane.state == LaneState::Failed {
             failed.push(lane);
             continue;
         }
@@ -454,6 +504,7 @@ fn regroup(container_lanes: Vec<Lane>, lane_field: &str, expected_lanes: &[Strin
                 },
                 blocks,
                 error: None,
+                truncated,
             }
         })
         .collect();
@@ -462,7 +513,14 @@ fn regroup(container_lanes: Vec<Lane>, lane_field: &str, expected_lanes: &[Strin
     lanes
 }
 
-fn build_query(field: &str, value: &str, partial: bool) -> Query {
+/// The query for one container, or why one could not be built.
+///
+/// Returning an error matters more than it looks: the previous version fell
+/// back to `WHERE <field> = null`, a query that succeeds and matches nothing,
+/// so a binding failure rendered as "awaiting — no document with this value".
+/// A bug that reports itself as an answer about your data is worse than one
+/// that reports itself as a bug.
+fn build_query(field: &str, value: &str, partial: bool) -> Result<Query, String> {
     let path = sql_path(field);
 
     if partial {
@@ -473,7 +531,7 @@ fn build_query(field: &str, value: &str, partial: bool) -> Query {
             format!("SELECT * FROM c WHERE IS_STRING({path}) AND CONTAINS({path}, @v, true)");
         return Query::from(text)
             .with_parameter("@v", value)
-            .unwrap_or_else(|_| Query::from(format!("SELECT * FROM c WHERE {path} = null")));
+            .map_err(|e| format!("could not bind the search value: {e}"));
     }
 
     // Cosmos is typed: a numeric id stored as a number won't match a string
@@ -485,23 +543,22 @@ fn build_query(field: &str, value: &str, partial: bool) -> Query {
         None => format!("SELECT * FROM c WHERE {path} = @v"),
     };
 
-    let query = Query::from(text);
-    let query = query
+    let query = Query::from(text)
         .with_parameter("@v", value)
-        .unwrap_or_else(|_| Query::from(format!("SELECT * FROM c WHERE {path} = null")));
+        .map_err(|e| format!("could not bind the search value: {e}"))?;
     match numeric {
         Some(n) => query
             .with_parameter("@n", n)
-            .unwrap_or_else(|_| Query::from(format!("SELECT * FROM c WHERE {path} = null"))),
-        None => query,
+            .map_err(|e| format!("could not bind the numeric search value: {e}")),
+        None => Ok(query),
     }
 }
 
 /// Renders a dotted field path as bracketed Cosmos SQL, so field names with
-/// spaces, dashes or reserved words survive.
+/// spaces, dashes, dots or reserved words survive.
 fn sql_path(path: &str) -> String {
     let mut out = String::from("c");
-    for part in path.split('.') {
+    for part in cosmos::split_path(path) {
         out.push_str("[\"");
         out.push_str(&part.replace('\\', "\\\\").replace('"', "\\\""));
         out.push_str("\"]");
@@ -542,24 +599,24 @@ fn build_block(
             continue;
         }
         if let Some(text) = lookup(doc, path).and_then(scalar_text) {
-            facts.push((leaf(path), truncate(&text, 28)));
+            facts.push((cosmos::leaf(path), truncate(&text, 28)));
             taken.push(path.clone());
         }
     }
 
     // Then whatever short scalars the document has, so a card is never blank.
-    if facts.len() < MAX_FACTS {
-        if let Value::Object(map) = doc {
-            for (name, value) in map {
-                if facts.len() >= MAX_FACTS
-                    || SYSTEM_FIELDS.contains(&name.as_str())
-                    || taken.contains(&name.to_lowercase())
-                {
-                    continue;
-                }
-                if let Some(text) = scalar_text(value).filter(|t| t.len() <= 28) {
-                    facts.push((name.clone(), text));
-                }
+    if facts.len() < MAX_FACTS
+        && let Value::Object(map) = doc
+    {
+        for (name, value) in map {
+            if facts.len() >= MAX_FACTS
+                || SYSTEM_FIELDS.contains(&name.as_str())
+                || taken.contains(&name.to_lowercase())
+            {
+                continue;
+            }
+            if let Some(text) = scalar_text(value).filter(|t| t.len() <= 28) {
+                facts.push((name.clone(), text));
             }
         }
     }
@@ -584,7 +641,10 @@ fn lookup<'a>(doc: &'a Value, lower_path: &str) -> Option<&'a Value> {
         return None;
     }
     let mut current = doc;
-    for segment in lower_path.split('.') {
+    // Split the same way `sql_path` does, so what is read locally and what is
+    // queried remotely are the same field even when a property name contains
+    // the separator.
+    for segment in cosmos::split_path(lower_path) {
         let Value::Object(map) = current else {
             return None;
         };
@@ -662,10 +722,6 @@ pub fn format_gap(millis: i64) -> String {
     }
 }
 
-fn leaf(path: &str) -> String {
-    path.rsplit('.').next().unwrap_or(path).to_string()
-}
-
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -689,6 +745,28 @@ mod tests {
         assert_eq!(sql_path(r#"od"d"#), r#"c["od\"d"]"#);
     }
 
+    /// A property name that contains the separator must survive the round
+    /// trip: `{"a.b": 1}` and `{"a": {"b": 1}}` are different documents, and
+    /// an unescaped path made them the same query.
+    #[test]
+    fn a_dot_inside_a_property_name_is_not_a_path_separator() {
+        let literal = cosmos::join_path("", "order.id");
+        let nested = cosmos::join_path(&cosmos::join_path("", "order"), "id");
+        assert_ne!(literal, nested);
+        assert_eq!(sql_path(&literal), r#"c["order.id"]"#);
+        assert_eq!(sql_path(&nested), r#"c["order"]["id"]"#);
+
+        let doc = json!({ "order.id": "abc", "order": { "id": "xyz" } });
+        assert_eq!(
+            lookup(&doc, &literal).and_then(scalar_text),
+            Some("abc".into())
+        );
+        assert_eq!(
+            lookup(&doc, &nested).and_then(scalar_text),
+            Some("xyz".into())
+        );
+    }
+
     fn query_text(q: &Query) -> String {
         serde_json::to_value(q).unwrap()["query"]
             .as_str()
@@ -696,16 +774,20 @@ mod tests {
             .to_string()
     }
 
+    fn built(field: &str, value: &str, partial: bool) -> Query {
+        build_query(field, value, partial).expect("query should build")
+    }
+
     #[test]
     fn exact_search_stays_an_indexed_equality() {
-        let text = query_text(&build_query("correlationId", "9b538528-aaaa", false));
+        let text = query_text(&built("correlationId", "9b538528-aaaa", false));
         assert!(text.contains(r#"c["correlationId"] = @v"#), "{text}");
         assert!(!text.contains("CONTAINS"), "{text}");
     }
 
     #[test]
     fn fragment_search_guards_contains_with_is_string() {
-        let text = query_text(&build_query("correlationId", "9b538528", true));
+        let text = query_text(&built("correlationId", "9b538528", true));
         // Without IS_STRING, a container holding a numeric value under the
         // same field fails the whole query rather than just not matching.
         assert!(text.contains(r#"IS_STRING(c["correlationId"])"#), "{text}");
@@ -719,8 +801,8 @@ mod tests {
     /// fragment path — CONTAINS is a string operation.
     #[test]
     fn a_numeric_fragment_does_not_gain_a_numeric_parameter() {
-        let exact = serde_json::to_value(build_query("orderId", "12345", false)).unwrap();
-        let fragment = serde_json::to_value(build_query("orderId", "12345", true)).unwrap();
+        let exact = serde_json::to_value(built("orderId", "12345", false)).unwrap();
+        let fragment = serde_json::to_value(built("orderId", "12345", true)).unwrap();
         assert_eq!(exact["parameters"].as_array().unwrap().len(), 2);
         assert_eq!(fragment["parameters"].as_array().unwrap().len(), 1);
     }
@@ -854,6 +936,7 @@ mod tests {
                 blocks,
                 state: LaneState::Reached,
                 error: None,
+                truncated: false,
             }],
         };
 
@@ -895,6 +978,7 @@ mod tests {
             },
             blocks,
             error: None,
+            truncated: false,
         }
     }
 
@@ -977,13 +1061,14 @@ mod tests {
                 name: "db/broken".into(),
                 detail: Some("correlationId".into()),
                 blocks: vec![],
-                state: LaneState::Failed(0),
+                state: LaneState::Failed,
                 error: Some("403".into()),
+                truncated: false,
             },
         ];
 
         let out = regroup(lanes, "workflowname", &[]);
-        let failed = out.iter().find(|l| l.state == LaneState::Failed(0));
+        let failed = out.iter().find(|l| l.state == LaneState::Failed);
         assert_eq!(failed.map(|l| l.name.as_str()), Some("db/broken"));
         assert_eq!(failed.and_then(|l| l.error.as_deref()), Some("403"));
     }
@@ -1084,6 +1169,7 @@ mod tests {
                     blocks: vec![],
                     state: LaneState::OffPath,
                     error: None,
+                    truncated: false,
                 },
             ],
         };
@@ -1138,6 +1224,7 @@ mod tests {
                 blocks: vec![],
                 state: LaneState::OffPath,
                 error: None,
+                truncated: false,
             },
         ];
 

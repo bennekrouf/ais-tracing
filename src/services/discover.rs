@@ -14,12 +14,8 @@
 //! (`orderId` here, `entityId` there). Names are used only as a weak
 //! tie-breaker, so an unfamiliar schema ranks on evidence alone.
 
-use crate::services::cosmos::ContainerSchema;
-use std::collections::{BTreeMap, BTreeSet};
-
-/// Cosmos-injected metadata. `_ts` is excluded here but offered separately as
-/// a time field, where it is genuinely useful.
-const SYSTEM_FIELDS: [&str; 6] = ["_rid", "_self", "_etag", "_attachments", "_ts", "_lsn"];
+use crate::services::cosmos::{ContainerSchema, SYSTEM_FIELDS};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// How many values two fields must share before they're taken to be the same
 /// identifier. Two is enough to be well past coincidence for long values.
@@ -27,6 +23,9 @@ const LINK_MIN_SHARED: usize = 2;
 /// Values shorter than this are too collision-prone to link on — `"1"` and
 /// `"ok"` appear everywhere and mean nothing.
 const LINK_MIN_LEN: usize = 8;
+/// A value appearing in more fields than this is a shared constant rather
+/// than an identity, whatever its length.
+const LINK_MAX_HOLDERS: usize = 32;
 
 /// One container's participation in a key: which field carries it there.
 #[derive(Clone, Debug, PartialEq)]
@@ -205,19 +204,67 @@ fn key_candidates(schemas: &[ContainerSchema]) -> Vec<KeyCandidate> {
 
     // Merge fields that are the same identifier: same name across containers,
     // or — regardless of name — enough shared values to rule out coincidence.
+    //
+    // Both halves are done by index rather than by comparing every field
+    // against every other. The pairwise version was O(fields²) with a set
+    // intersection inside, and `analyze` runs on the UI thread — a busy
+    // account made opening a window visibly stall.
     let mut dsu = Dsu::new(nodes.len());
-    for i in 0..nodes.len() {
-        for j in (i + 1)..nodes.len() {
-            // Only ever link across containers. Two fields of one document
-            // sharing values (`orderId` / `parentOrderId`) are related, but
-            // they are not one key.
-            if nodes[i].schema == nodes[j].schema {
-                continue;
-            }
-            if nodes[i].name_key == nodes[j].name_key
-                || shared_count(&nodes[i].linkable, &nodes[j].linkable) >= LINK_MIN_SHARED
-            {
-                dsu.union(i, j);
+
+    // Same name, different container: a group-by, not a search.
+    //
+    // Every member joins, not just adjacent pairs. The rule links two fields
+    // when they share a name *and* sit in different containers, and under that
+    // rule a group spanning two or more containers is fully connected — every
+    // member has an edge to every member elsewhere. A group confined to one
+    // container (two spellings of one name in the same documents) has no edges
+    // at all, and must stay separate.
+    let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, node) in nodes.iter().enumerate() {
+        by_name.entry(node.name_key.as_str()).or_default().push(i);
+    }
+    for members in by_name.values() {
+        let spans_containers = members
+            .iter()
+            .any(|&i| nodes[i].schema != nodes[members[0]].schema);
+        if !spans_containers {
+            continue;
+        }
+        for pair in members.windows(2) {
+            dsu.union(pair[0], pair[1]);
+        }
+    }
+
+    // Shared values: only fields that actually carry a value in common are
+    // ever compared, so the work is proportional to the values sampled rather
+    // than to the square of the field count.
+    let mut by_value: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, node) in nodes.iter().enumerate() {
+        for value in &node.linkable {
+            by_value.entry(value).or_default().push(i);
+        }
+    }
+    let mut shared: HashMap<(usize, usize), usize> = HashMap::new();
+    for holders in by_value.values() {
+        // A value carried by this many different fields is a constant, not an
+        // identifier — and it is the only shape that could make the pair loop
+        // below expensive again.
+        if holders.len() > LINK_MAX_HOLDERS {
+            continue;
+        }
+        for (a, &i) in holders.iter().enumerate() {
+            for &j in &holders[a + 1..] {
+                // Only ever link across containers. Two fields of one document
+                // sharing values (`orderId` / `parentOrderId`) are related, but
+                // they are not one key.
+                if nodes[i].schema == nodes[j].schema {
+                    continue;
+                }
+                let count = shared.entry((i.min(j), i.max(j))).or_default();
+                *count += 1;
+                if *count == LINK_MIN_SHARED {
+                    dsu.union(i, j);
+                }
             }
         }
     }
@@ -577,13 +624,6 @@ fn name_suggests_identifier(lower: &str) -> bool {
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
-fn shared_count(a: &BTreeSet<&str>, b: &BTreeSet<&str>) -> usize {
-    if a.len() > b.len() {
-        return shared_count(b, a);
-    }
-    a.iter().filter(|v| b.contains(*v)).count()
-}
-
 fn join(names: &BTreeSet<&str>) -> String {
     names.iter().copied().collect::<Vec<_>>().join(", ")
 }
@@ -834,6 +874,59 @@ mod tests {
         // `_ts` is always offered, but never ahead of a real domain timestamp.
         assert!(insights.times.iter().any(|c| c.id == "_ts"));
         assert!(insights.labels.iter().any(|c| c.label == "eventType"));
+    }
+
+    /// One value in common is coincidence; `LINK_MIN_SHARED` is the floor.
+    /// The indexed merge counts co-occurrences rather than intersecting every
+    /// pair of fields, so this is the property that has to hold.
+    #[test]
+    fn a_single_shared_value_is_not_enough_to_link() {
+        let ids = uuids();
+        let schemas = vec![
+            container("shop", "a", vec![field("leftId", &ids[..1])]),
+            container("shop", "b", vec![field("rightId", &ids[..1])]),
+        ];
+        let insights = analyze(&schemas);
+        assert!(
+            insights.keys.iter().all(|c| c.bindings.len() == 1),
+            "one value in common is coincidence, not a link"
+        );
+
+        // Two is.
+        let schemas = vec![
+            container("shop", "a", vec![field("leftId", &ids[..2])]),
+            container("shop", "b", vec![field("rightId", &ids[..2])]),
+        ];
+        let insights = analyze(&schemas);
+        assert_eq!(insights.keys[0].bindings.len(), 2);
+        assert_eq!(insights.keys[0].shared_values, 2);
+    }
+
+    /// Same name across containers links regardless of values — that half of
+    /// the merge is a group-by now, and must still hold.
+    #[test]
+    fn the_same_name_in_two_containers_is_one_key() {
+        let schemas = vec![
+            container("shop", "a", vec![field("correlationId", &["aaaaaaaaaaaa"])]),
+            container("shop", "b", vec![field("correlationId", &["bbbbbbbbbbbb"])]),
+        ];
+        let best = &analyze(&schemas).keys[0];
+        assert_eq!(best.bindings.len(), 2);
+        assert_eq!(best.shared_values, 0, "no values in common, only the name");
+    }
+
+    /// Three containers naming the field the same way are one key, not two
+    /// groups. The indexed merge unions a whole name group at once, so this
+    /// guards the case a naive adjacent-pairs version would split.
+    #[test]
+    fn every_container_sharing_a_name_lands_in_one_group() {
+        let schemas = vec![
+            container("shop", "a", vec![field("correlationId", &["aaaaaaaaaaaa"])]),
+            container("shop", "b", vec![field("correlationid", &["bbbbbbbbbbbb"])]),
+            container("shop", "c", vec![field("CorrelationId", &["cccccccccccc"])]),
+        ];
+        let best = &analyze(&schemas).keys[0];
+        assert_eq!(best.bindings.len(), 3, "got {:?}", best.bindings);
     }
 
     #[test]

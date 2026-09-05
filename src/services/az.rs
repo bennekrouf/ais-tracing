@@ -169,17 +169,25 @@ pub fn check_login() -> AzLoginState {
 
 /// Opens `az login` (non-blocking) so the desktop app doesn't have to embed
 /// its own OAuth flow — same approach as ais-monitor.
+///
+/// The sign-in itself happens in a browser, so there is nothing to await here
+/// — but the child still has to be reaped. Dropping the `Child` does not wait
+/// for it, so every abandoned or completed sign-in left a zombie behind for
+/// the life of the app. A detached thread collects it.
 pub fn open_login() -> Result<(), String> {
-    az_command_with_console(&["login"])
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                "Azure CLI ('az') not found on PATH.".to_string()
-            } else {
-                format!("Failed to start 'az login': {e}")
-            }
-        })
+    let child = az_command_with_console(&["login"]).spawn().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            "Azure CLI ('az') not found on PATH.".to_string()
+        } else {
+            format!("Failed to start 'az login': {e}")
+        }
+    })?;
+
+    std::thread::spawn(move || {
+        let mut child = child;
+        let _ = child.wait();
+    });
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -189,6 +197,7 @@ struct Subscription {
     name: String,
 }
 
+/// Every subscription the signed-in account can see.
 fn list_subscriptions() -> Result<Vec<Subscription>, String> {
     let output = az_command(&[
         "account",
@@ -230,6 +239,13 @@ pub struct SubscriptionError {
 pub struct AccountScan {
     pub accounts: Vec<CosmosAccount>,
     pub errors: Vec<SubscriptionError>,
+    /// How many subscriptions were looked at, in total.
+    ///
+    /// Counted here rather than derived by the UI: a subscription that
+    /// answered successfully and simply held no Cosmos accounts appears in
+    /// neither list, so counting the two lists misses it — and told a user
+    /// with an empty tenant that they had "0 subscriptions".
+    pub subscriptions: usize,
 }
 
 impl AccountScan {
@@ -298,7 +314,10 @@ pub struct CosmosAccount {
 /// separate from the data-plane SDK calls in `cosmos.rs`.
 pub fn list_cosmos_accounts() -> Result<AccountScan, String> {
     let subscriptions = list_subscriptions()?;
-    let mut scan = AccountScan::default();
+    let mut scan = AccountScan {
+        subscriptions: subscriptions.len(),
+        ..AccountScan::default()
+    };
     for sub in subscriptions {
         let output = az_command(&[
             "cosmosdb",
@@ -466,6 +485,7 @@ mod tests {
                 message: "session expired".into(),
                 expired: true,
             }],
+            subscriptions: 1,
         };
         assert!(failed.blind());
         assert!(failed.any_expired());
@@ -492,6 +512,7 @@ mod tests {
                 message: "PIM not activated".into(),
                 expired: false,
             }],
+            subscriptions: 2,
         };
         assert!(
             !partial.blind(),

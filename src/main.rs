@@ -52,10 +52,14 @@ fn window_icon() -> Option<dioxus::desktop::tao::window::Icon> {
 
 /// Opens another window on `account`, in this same process.
 ///
-/// One process, many windows — not many processes. Two copies of the binary
-/// would race each other on cached history/config files. Windows inside one
-/// process share none of that: each gets its own VirtualDom and its own
-/// signals, and the OS sees a single app.
+/// One process, many windows — not many processes: each window gets its own
+/// VirtualDom and its own signals, while the OS sees a single app with one
+/// icon and one dock entry.
+///
+/// It is not what keeps the on-disk state safe, and it was a mistake to write
+/// that it was. Nothing stops a second copy of the binary being launched, so
+/// the config and cache files have to survive concurrent writers on their own
+/// — see `services::atomic_write`.
 pub fn open_in_new_window(account: CosmosAccount) {
     let name = account.name.clone();
     let dom = VirtualDom::new_with_props(
@@ -123,10 +127,15 @@ fn WindowRoot(initial: Option<CosmosAccount>) -> Element {
     );
 
     use_effect(move || {
-        let css = MAIN_CSS.replace('`', "\\`").replace("${", "\\${");
+        // Serialised as a JSON string rather than pasted into a template
+        // literal. The hand-rolled version escaped backticks and `${` but not
+        // backslashes, so the first CSS escape sequence anyone wrote —
+        // `content: "\201C"` — would have been eaten by the JS parser instead.
+        // JSON string syntax is a subset of JS string syntax, so this is
+        // correct for any input.
+        let css = serde_json::to_string(MAIN_CSS).unwrap_or_else(|_| "\"\"".to_string());
         document::eval(&format!(
-            "if(!document.getElementById('ais-css')){{var s=document.createElement('style');s.id='ais-css';s.textContent=`{}`;document.head.appendChild(s);}}",
-            css
+            "if(!document.getElementById('ais-css')){{var s=document.createElement('style');s.id='ais-css';s.textContent={css};document.head.appendChild(s);}}"
         ));
     });
 

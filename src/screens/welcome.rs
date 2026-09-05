@@ -1,4 +1,4 @@
-use crate::services::az::{self, AzLoginState, CosmosAccount};
+use crate::services::az::{self, AzLoginState};
 use crate::services::history;
 use dioxus::prelude::*;
 
@@ -52,33 +52,33 @@ fn start_login<F>(
 pub fn Welcome() -> Element {
     let mut az_state = use_signal(|| AzLoginState::AzNotFound);
     let mut checking = use_signal(|| true);
-    let mut accounts = use_signal(Vec::<CosmosAccount>::new);
+    // The whole scan, kept intact: `blind()` and `any_expired()` are the two
+    // questions the screen has to answer, and re-deriving them from the parts
+    // is how the two drift.
+    let mut scan = use_signal(az::AccountScan::default);
     let mut accounts_error = use_signal(|| Option::<String>::None);
-    // Subscriptions that could not be read. Without these an expired session
-    // is indistinguishable from an empty tenant.
-    let mut skipped = use_signal(Vec::<az::SubscriptionError>::new);
     let mut loading_accounts = use_signal(|| false);
-    let mut selected_name = use_signal(String::new);
-    let mut login_error = use_signal(|| Option::<String>::None);
+    // Accounts are identified by endpoint, never by display name: two
+    // subscriptions can hold accounts called the same thing, and picking the
+    // first match by name silently opens the wrong one.
+    let mut selected_endpoint = use_signal(String::new);
+    let login_error = use_signal(|| Option::<String>::None);
     let mut recent = use_signal(history::load_accounts);
 
     let mut load_accounts = move || {
         loading_accounts.set(true);
         spawn(async move {
             match tokio::task::spawn_blocking(az::list_cosmos_accounts).await {
-                Ok(Ok(scan)) => {
-                    accounts.set(scan.accounts);
-                    skipped.set(scan.errors);
+                Ok(Ok(found)) => {
+                    scan.set(found);
                     accounts_error.set(None);
                 }
                 Ok(Err(e)) => {
-                    accounts.set(vec![]);
-                    skipped.set(vec![]);
+                    scan.set(az::AccountScan::default());
                     accounts_error.set(Some(e));
                 }
                 Err(e) => {
-                    accounts.set(vec![]);
-                    skipped.set(vec![]);
+                    scan.set(az::AccountScan::default());
                     accounts_error.set(Some(e.to_string()));
                 }
             }
@@ -101,16 +101,14 @@ pub fn Welcome() -> Element {
     });
 
     let is_logged_in = matches!(*az_state.read(), AzLoginState::LoggedIn { .. });
-    let list = accounts.read().clone();
-    // Every subscription either produced accounts or produced an error, so
-    // the two together are what was actually looked at.
-    let subscription_count = list
-        .iter()
-        .map(|a| a.subscription_id.as_str())
-        .collect::<std::collections::BTreeSet<_>>()
-        .len()
-        + skipped.read().len();
-    let can_connect = !selected_name.read().is_empty();
+    let list = scan.read().accounts.clone();
+    let skipped = scan.read().errors.clone();
+    // Reported by the scan, which counted the subscriptions it enumerated —
+    // including the ones that answered and simply held nothing.
+    let subscription_count = scan.read().subscriptions;
+    let blind = scan.read().blind();
+    let any_expired = scan.read().any_expired();
+    let can_connect = !selected_endpoint.read().is_empty();
 
     rsx! {
         div { class: "welcome",
@@ -195,49 +193,57 @@ pub fn Welcome() -> Element {
                                 // "Nothing found" and "nothing could be read"
                                 // are different claims. Only make the first
                                 // one when every subscription actually answered.
-                                if skipped.read().is_empty() {
+                                if blind {
+                                    div { class: "az-error",
+                                        "Could not read {skipped.len()} of "
+                                        "{subscription_count} subscriptions, so this is not "
+                                        "an answer about whether you have Cosmos DB accounts."
+                                    }
+                                } else {
                                     div { class: "az-hint",
                                         "No Cosmos DB accounts in any of your "
                                         "{subscription_count} subscriptions."
-                                    }
-                                } else {
-                                    div { class: "az-error",
-                                        "Could not read {skipped.read().len()} of "
-                                        "{subscription_count} subscriptions, so this is not "
-                                        "an answer about whether you have Cosmos DB accounts."
                                     }
                                 }
                             } else {
                                 div { class: "az-field",
                                     select {
-                                        onchange: move |evt| selected_name.set(evt.value()),
-                                        option { value: "", selected: selected_name.read().is_empty(), "-- choose an account --" }
+                                        onchange: move |evt| selected_endpoint.set(evt.value()),
+                                        option { value: "", selected: selected_endpoint.read().is_empty(), "-- choose an account --" }
                                         for acc in list.iter() {
-                                            option { value: "{acc.name}", "{acc.name}  ({acc.resource_group})" }
+                                            option {
+                                                value: "{acc.endpoint}",
+                                                "{acc.name}  ({acc.resource_group})"
+                                            }
                                         }
                                     }
                                 }
                             }
-                            if !skipped.read().is_empty() {
+                            if !skipped.is_empty() {
                                 div { class: "skipped-list",
-                                    if skipped.read().iter().any(|e| e.expired) {
+                                    if any_expired {
                                         div { class: "az-error",
                                             "Your Azure session has expired. Sign in again and rescan — "
                                             "until then these subscriptions cannot be read at all."
                                             button {
                                                 class: "btn-primary",
                                                 style: "margin-left:10px;",
-                                                onclick: move |_| {
-                                                    login_error.set(None);
-                                                    if let Err(e) = az::open_login() {
-                                                        login_error.set(Some(e));
-                                                    }
-                                                },
+                                                // Through `start_login`, not a bare
+                                                // `open_login`: without the poll the
+                                                // screen keeps saying "expired" after a
+                                                // successful sign-in, which is the exact
+                                                // bug `start_login` was written for.
+                                                onclick: move |_| start_login(
+                                                    az_state,
+                                                    checking,
+                                                    login_error,
+                                                    load_accounts,
+                                                ),
                                                 "Sign in again"
                                             }
                                         }
                                     }
-                                    for e in skipped.read().iter() {
+                                    for e in skipped.iter() {
                                         div { class: "skipped-row",
                                             span { class: "dot error" }
                                             span { class: "skipped-name", "{e.name}" }
@@ -254,8 +260,8 @@ pub fn Welcome() -> Element {
                                     onclick: {
                                         let list = list.clone();
                                         move |_| {
-                                            let name = selected_name.read().clone();
-                                            if let Some(acc) = list.iter().find(|a| a.name == name).cloned() {
+                                            let endpoint = selected_endpoint.read().clone();
+                                            if let Some(acc) = list.iter().find(|a| a.endpoint == endpoint).cloned() {
                                                 recent.set(history::record_account(&acc));
                                                 crate::open_in_new_window(acc);
                                             }
