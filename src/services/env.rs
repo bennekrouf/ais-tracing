@@ -11,7 +11,10 @@
 //!
 //! A *non-interactive* login shell is used deliberately: it reads the profile
 //! where `brew shellenv` lives, without the risk that an interactive shell
-//! blocks on something and hangs startup before a window ever appears.
+//! blocks on something and hangs startup before a window ever appears. It is
+//! also given a deadline, because `-l` can block on its own — a profile that
+//! sources a version manager or waits on the network is common enough, and
+//! this runs before there is any window to explain the wait in.
 //!
 //! Windows has the same symptom from a different cause. There is no login
 //! shell to ask, but Explorer hands a GUI app the environment it held at
@@ -116,23 +119,51 @@ fn tidy(dir: PathBuf) -> Option<PathBuf> {
     (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
 }
 
+/// How long the profile gets to answer before we give up on it.
+///
+/// Nothing is on screen while this runs, so the cost of waiting is a window
+/// that has not appeared. Two seconds is far longer than any profile that is
+/// working, and far shorter than one that is stuck.
+#[cfg(unix)]
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[cfg(unix)]
 fn login_shell_path() -> Option<String> {
+    use std::io::Read;
     use std::process::{Command, Stdio};
+    use std::time::Instant;
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-    let output = Command::new(&shell)
+    let mut child = Command::new(&shell)
         // -l reads the profile (where `brew shellenv` normally is); no -i, so
         // an interactive prompt can never block startup.
         .args(["-lc", "printf '%s' \"$PATH\""])
         .stdin(Stdio::null())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
 
-    if !output.status.success() {
-        return None;
+    // Polled rather than waited on: `Child::wait` has no deadline, and a
+    // profile that hangs would hang the app with it. A `PATH` is far smaller
+    // than a pipe buffer, so the child cannot block writing it while we wait.
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(_)) | Err(_) => return None,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
     }
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    let mut text = String::new();
+    child.stdout.take()?.read_to_string(&mut text).ok()?;
+    let text = text.trim().to_string();
     (!text.is_empty()).then_some(text)
 }
 

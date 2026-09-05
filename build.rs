@@ -5,35 +5,39 @@
 //! window title bar. If absent, the build still succeeds (icon-less) with
 //! a `cargo:warning` so the gap is visible in build logs.
 //!
-//! Non-Windows targets are a no-op.
+//! Non-Windows *targets* are a no-op — note the target, not the host. A build
+//! script is compiled for the machine doing the building, so `cfg!(windows)`
+//! here asks "am I running on Windows", which is the wrong question: cross
+//! compiling to Windows from anything else silently produced an icon-less
+//! exe. `CARGO_CFG_TARGET_OS` is what Cargo sets to answer the right one.
 
 fn main() {
     println!("cargo:rerun-if-changed=assets/icon.ico");
     println!("cargo:rerun-if-changed=build.rs");
 
-    #[cfg(target_os = "windows")]
-    {
-        let icon_path = std::path::Path::new("assets/icon.ico");
-        if !icon_path.exists() {
-            println!(
-                "cargo:warning=assets/icon.ico not found — the .exe will ship without an embedded icon. \
-                 Drop a multi-resolution .ico file there to brand the Windows build."
-            );
-            return;
-        }
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
 
-        let mut res = winresource::WindowsResource::new();
-        res.set_icon("assets/icon.ico");
-        res.set("FileDescription", "AIS Tracing");
-        res.set("ProductName", "AIS Tracing");
-        res.set("CompanyName", "Bennekrouf");
-        res.set("LegalCopyright", "© Bennekrouf");
-        if let Err(e) = res.compile() {
-            println!(
-                "cargo:warning=Failed to embed Windows icon resource: {} \
-                 (the build will continue without an icon)",
-                e
-            );
-        }
+    let icon_path = std::path::Path::new("assets/icon.ico");
+    if !icon_path.exists() {
+        println!(
+            "cargo:warning=assets/icon.ico not found — the .exe will ship without an embedded icon. \
+             Drop a multi-resolution .ico file there to brand the Windows build."
+        );
+        return;
+    }
+
+    let mut res = winresource::WindowsResource::new();
+    res.set_icon("assets/icon.ico");
+    res.set("FileDescription", "AIS Tracing");
+    res.set("ProductName", "AIS Tracing");
+    res.set("CompanyName", "Bennekrouf");
+    res.set("LegalCopyright", "© Bennekrouf");
+    if let Err(e) = res.compile() {
+        println!(
+            "cargo:warning=Failed to embed Windows icon resource: {e} \
+             (the build will continue without an icon)"
+        );
     }
 }

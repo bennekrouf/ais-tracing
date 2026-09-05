@@ -51,16 +51,12 @@ pub fn save(endpoint: &str, schemas: &[ContainerSchema]) {
     if schemas.is_empty() {
         return;
     }
-    let path = path(endpoint);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
     let scan = CachedScan {
         scanned_at: chrono::Utc::now().timestamp(),
         schemas: schemas.to_vec(),
     };
     if let Ok(json) = serde_json::to_string(&scan) {
-        let _ = std::fs::write(path, json);
+        crate::services::atomic_write(&path(endpoint), &json);
     }
 }
 

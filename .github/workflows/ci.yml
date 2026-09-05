@@ -79,10 +79,10 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
-      # Advisory, and deliberately last: the target dir is warm from the test
-      # build, so this costs a fraction of a standalone clippy job. Drop the
-      # continue-on-error and add `-- -D warnings` once the existing warnings
-      # are cleared (most are `cargo clippy --fix` one-liners).
+      # Blocking, and deliberately last: the target dir is warm from the test
+      # build, so this costs a fraction of a standalone clippy job. It was
+      # advisory while the tree still had warnings — which is how a dead
+      # `AccountScan::blind` sat in the codebase, tested, while the screen it
+      # was written for re-derived the same answer inline.
       - name: Clippy
-        continue-on-error: true
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets -- -D warnings

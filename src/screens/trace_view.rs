@@ -16,6 +16,14 @@ const CARD_GAP: f64 = 10.0;
 const PAD: f64 = 20.0;
 /// Width the timeline gets when nothing forces it wider.
 const BASE_TRACK: f64 = 900.0;
+/// Pixels the time span is mapped onto — the one scale both the cards and the
+/// axis are drawn against.
+///
+/// The track itself can end up wider than `BASE_TRACK`, because overlapping
+/// cards are nudged right until they fit. That extra width is spillover, not
+/// extra time: stretching the ticks across it while the cards stay on this
+/// scale put every label a few hundred pixels away from the event it names.
+const USABLE: f64 = BASE_TRACK - CARD_W - 2.0 * PAD;
 const TICKS: usize = 5;
 
 #[derive(Props, Clone, PartialEq)]
@@ -41,12 +49,13 @@ pub struct TraceViewProps {
 pub fn TraceView(props: TraceViewProps) -> Element {
     let trace = &props.trace;
     let (lanes, track_w) = place(trace);
+    let truncated = trace.truncated_lanes();
     let off_path: Vec<&Lane> = trace
         .lanes
         .iter()
         .filter(|l| l.state == LaneState::OffPath)
         .collect();
-    let ticks = axis_ticks(trace, track_w);
+    let ticks = axis_ticks(trace);
     // A red card can sit far off-screen on a wide timeline, so the count has
     // to be visible without scrolling to find it.
     let errored = trace
@@ -78,6 +87,14 @@ pub fn TraceView(props: TraceViewProps) -> Element {
                     span { class: "chip bad", "{errored} errored" }
                 }
                 span { class: "chip muted", "{trace.blocks_found} documents" }
+                // Never let a capped count read as a complete one.
+                if truncated > 0 {
+                    span {
+                        class: "chip warn",
+                        title: "Only the first documents of each lane were fetched — there are more.",
+                        "{truncated} lane(s) truncated"
+                    }
+                }
                 div { class: "spacer" }
                 // The axis control lives next to the axis it changes. Setting
                 // it from a distant panel made a no-op indistinguishable from
@@ -166,9 +183,23 @@ pub fn TraceView(props: TraceViewProps) -> Element {
     }
 }
 
+/// A lane with its cards already positioned.
+///
+/// Deliberately not `{ lane: Lane, blocks: Vec<(f64, Block)> }`: a `Lane` owns
+/// its own `Vec<Block>`, and every `Block` owns the whole Cosmos document
+/// behind it. Keeping both meant each render copied every document twice here
+/// and a third time passing this to `LaneRow` — megabytes of memcpy per
+/// keystroke on a lane holding a couple of hundred documents. Only the fields
+/// the row actually draws are carried, and the blocks live in exactly one
+/// place.
 #[derive(Clone, PartialEq)]
 struct PlacedLane {
-    lane: Lane,
+    name: String,
+    detail: Option<String>,
+    state: LaneState,
+    error: Option<String>,
+    truncated: bool,
+    first_at: Option<i64>,
     blocks: Vec<(f64, Block)>,
 }
 
@@ -183,15 +214,15 @@ struct LaneRowProps {
 
 #[component]
 fn LaneRow(props: LaneRowProps) -> Element {
-    let lane = &props.lane.lane;
+    let lane = &props.lane;
     let class = match lane.state {
         LaneState::Reached => "lane reached",
         LaneState::Awaiting => "lane awaiting",
-        LaneState::Failed(_) => "lane failed",
+        LaneState::Failed => "lane failed",
         LaneState::OffPath => "lane off-path",
     };
     // How long after the first event anywhere this stage saw the value.
-    let gap = match (props.start, lane.first_at()) {
+    let gap = match (props.start, lane.first_at) {
         (Some(start), Some(at)) if at > start => Some(trace::format_gap(at - start)),
         _ => None,
     };
@@ -206,13 +237,20 @@ fn LaneRow(props: LaneRowProps) -> Element {
                 if let Some(gap) = gap {
                     span { class: "lane-gap", "{gap}" }
                 }
+                if lane.truncated {
+                    span {
+                        class: "lane-truncated",
+                        title: "More documents carry this value than are drawn here.",
+                        "showing the first {props.lane.blocks.len()}"
+                    }
+                }
             }
             div { class: "lane-body",
                 match lane.state {
                     LaneState::Awaiting => rsx! {
                         div { class: "lane-note", "awaiting — no document with this value" }
                     },
-                    LaneState::Failed(_) => rsx! {
+                    LaneState::Failed => rsx! {
                         div { class: "lane-note error",
                             "query failed: {lane.error.clone().unwrap_or_default()}"
                         }
@@ -259,7 +297,7 @@ fn LaneRow(props: LaneRowProps) -> Element {
 /// cards apart within their lane. Blocks with no usable timestamp fall back
 /// to sequence order after the ones that have times.
 fn place(trace: &Trace) -> (Vec<PlacedLane>, f64) {
-    let usable = BASE_TRACK - CARD_W - 2.0 * PAD;
+    let usable = USABLE;
     let mut out = Vec::new();
     let mut widest = BASE_TRACK;
 
@@ -296,12 +334,40 @@ fn place(trace: &Trace) -> (Vec<PlacedLane>, f64) {
             widest = widest.max(x + CARD_W + PAD);
         }
         out.push(PlacedLane {
-            lane: lane.clone(),
+            name: lane.name.clone(),
+            detail: lane.detail.clone(),
+            state: lane.state,
+            error: lane.error.clone(),
+            truncated: lane.truncated,
+            first_at: lane.first_at(),
             blocks: placed,
         });
     }
 
     (out, widest)
+}
+
+fn axis_ticks(trace: &Trace) -> Vec<(f64, String)> {
+    let Some((lo, hi)) = trace.span else {
+        return Vec::new();
+    };
+    if hi <= lo {
+        return vec![(PAD, trace::format_time(lo))];
+    }
+    // `USABLE`, not the final track width: see the constant.
+    let usable = USABLE;
+    (0..TICKS)
+        .map(|i| {
+            let frac = i as f64 / (TICKS - 1) as f64;
+            let at = lo + ((hi - lo) as f64 * frac) as i64;
+            let text = if i == 0 {
+                trace::format_time(at)
+            } else {
+                trace::format_gap(at - lo)
+            };
+            (PAD + frac * usable, text)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -328,6 +394,7 @@ mod tests {
             blocks,
             state,
             error: None,
+            truncated: false,
         }
     }
 
@@ -417,7 +484,7 @@ mod tests {
             lane("db/c", LaneState::OffPath, vec![]),
         ]);
         let (placed, _) = place(&t);
-        let names: Vec<&str> = placed.iter().map(|p| p.lane.name.as_str()).collect();
+        let names: Vec<&str> = placed.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["db/a", "db/b"]);
     }
 
@@ -426,7 +493,7 @@ mod tests {
         let t = trace_of(vec![lane("db/a", LaneState::Reached, vec![block(Some(7))])]);
         let (placed, _) = place(&t);
         assert_eq!(placed[0].blocks[0].0, PAD);
-        assert_eq!(axis_ticks(&t, BASE_TRACK).len(), 1);
+        assert_eq!(axis_ticks(&t).len(), 1);
     }
 
     #[test]
@@ -435,31 +502,36 @@ mod tests {
             lane("db/a", LaneState::Reached, vec![block(Some(0))]),
             lane("db/b", LaneState::Reached, vec![block(Some(60_000))]),
         ]);
-        let ticks = axis_ticks(&t, BASE_TRACK);
+        let ticks = axis_ticks(&t);
         assert_eq!(ticks.len(), TICKS);
         assert_eq!(ticks[0].0, PAD);
         assert_eq!(ticks[TICKS - 1].1, "+1.0min");
     }
-}
 
-fn axis_ticks(trace: &Trace, track_w: f64) -> Vec<(f64, String)> {
-    let Some((lo, hi)) = trace.span else {
-        return Vec::new();
-    };
-    if hi <= lo {
-        return vec![(PAD, trace::format_time(lo))];
+    /// The regression: cards were positioned against `BASE_TRACK` while the
+    /// ticks were stretched across the widened track, so on any timeline that
+    /// had to grow, every label pointed hundreds of pixels away from the event
+    /// it named. The card holding the last timestamp must sit under the last
+    /// tick — and the test has to derive the width from `place`, because
+    /// passing `BASE_TRACK` by hand is what hid this.
+    #[test]
+    fn the_axis_and_the_cards_use_one_scale_on_a_widened_track() {
+        // Eight cards a millisecond apart force the track past BASE_TRACK.
+        let crowded: Vec<Block> = (0..8).map(|i| block(Some(i))).collect();
+        let t = trace_of(vec![
+            lane("db/a", LaneState::Reached, crowded),
+            lane("db/b", LaneState::Reached, vec![block(Some(600_000))]),
+        ]);
+
+        let (placed, width) = place(&t);
+        assert!(width > BASE_TRACK, "expected a widened track, got {width}");
+
+        let ticks = axis_ticks(&t);
+        let last_tick = ticks[TICKS - 1].0;
+        let latest_card = placed[1].blocks[0].0;
+        assert!(
+            (latest_card - last_tick).abs() < 1.0,
+            "the card at the latest time sits at {latest_card}, its tick at {last_tick}"
+        );
     }
-    let usable = track_w - CARD_W - 2.0 * PAD;
-    (0..TICKS)
-        .map(|i| {
-            let frac = i as f64 / (TICKS - 1) as f64;
-            let at = lo + ((hi - lo) as f64 * frac) as i64;
-            let text = if i == 0 {
-                trace::format_time(at)
-            } else {
-                trace::format_gap(at - lo)
-            };
-            (PAD + frac * usable, text)
-        })
-        .collect()
 }
