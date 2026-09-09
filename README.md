@@ -9,6 +9,12 @@ they show where the data hasn't arrived.
 
 ---
 
+## What's new
+
+Every version and what changed in it: [Release notes](https://mayorana.ch/en/apps/ais-tracing/releases).
+The notes are written in [`CHANGELOG.md`](CHANGELOG.md) and published from there — to that page, to
+`releases.json` beside the builds, and to the GitHub Release body.
+
 ## Install
 
 Downloads are on the [latest release](https://github.com/bennekrouf/ais-tracing/releases/latest).
