@@ -15,6 +15,30 @@ Each heading is dated on the day its tag was pushed. Releases that carried only
 build or packaging work say so rather than being hidden: the version numbers a
 user sees in the update prompt should all be accounted for.
 
+## [0.1.25] - 2026-09-14
+
+### Changed
+
+- Packaging only — no user-visible change.
+
+## [0.1.24] - 2026-09-14
+
+### Added
+
+- A banner at startup for occasional messages from us, such as a request for
+  feedback. It is fetched once from mayorana.ch, stays until you dismiss it and
+  is not shown again after that. If the notice cannot be fetched, no banner
+  appears and startup is not slowed. Setting `DISABLE_UPDATE_CHECK` turns it off
+  along with the update check.
+
+## [0.1.23] - 2026-09-09
+
+### Changed
+
+- Packaging only — no user-visible change in the app. The notes for every
+  release, with its download, are now published at
+  [mayorana.ch/en/apps/ais-tracing/releases](https://mayorana.ch/en/apps/ais-tracing/releases).
+
 ## [0.1.22] - 2026-09-05
 
 ### Changed
