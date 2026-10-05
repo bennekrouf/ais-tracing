@@ -623,6 +623,20 @@ jobs:
           fi
           python3 -c "import json; d=json.load(open('release/releases.json')); print(len(d['releases']), 'releases, newest', d['releases'][0]['version'] if d['releases'] else 'none')"
 
+      # ── Claude skill ───────────────────────────────────────────────────────
+      # skill/ais-tracing/ is a Claude skill for the people using the app: how it
+      # works, known failures and their fixes, and help writing a problem
+      # report. Packaged here so the copy users download always matches the
+      # release it ships with, and published beside the builds like
+      # releases.json. claude.ai takes a .zip whose top folder is named like
+      # the skill; Claude Code users unzip it into ~/.claude/skills/.
+      - name: Package the Claude skill
+        run: |
+          set -euo pipefail
+          test -f skill/ais-tracing/SKILL.md
+          (cd skill && zip -qr "../release/ais-tracing-claude-skill.zip" "ais-tracing" -x "*.DS_Store" "ais-tracing/evals/*")
+          unzip -l "release/ais-tracing-claude-skill.zip"
+
       # Notes list only the platforms actually present, so nobody is sent to a
       # download link that 404s.
       - name: Compose release notes
