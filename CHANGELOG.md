@@ -15,6 +15,14 @@ Each heading is dated on the day its tag was pushed. Releases that carried only
 build or packaging work say so rather than being hidden: the version numbers a
 user sees in the update prompt should all be accounted for.
 
+## [Unreleased]
+
+### Changed
+
+- The application now uses the static C runtime on Windows, which means it no
+  longer requires the Visual C++ Redistributable to be installed. This reduces
+  the size of the installer and ensures the application runs on any Windows PC.
+
 ## [0.1.30] - 2026-10-07
 
 ### Changed
