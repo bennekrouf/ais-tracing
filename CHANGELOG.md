@@ -15,6 +15,21 @@ Each heading is dated on the day its tag was pushed. Releases that carried only
 build or packaging work say so rather than being hidden: the version numbers a
 user sees in the update prompt should all be accounted for.
 
+## [Unreleased]
+
+### Added
+
+- AIS Tracing can be used from Claude Desktop, Claude Code, Codex or VS Code.
+  The new **MCP** button, on the welcome screen and in the top bar, adds it
+  in one click. Claude can then list your Cosmos DB accounts, sample their
+  containers, find the fields that link documents together and follow a
+  value through them, as the window does. It only reads: granting the Data
+  Reader role and error rules stay in the window.
+- The update banner now offers **Install & restart**. AIS Tracing downloads
+  the new version, checks it, puts it in place of the one you are running
+  and opens it again. A copy that can't replace itself still gets the
+  **Download** button.
+
 ## [0.1.31] - 2026-10-31
 
 ### Changed
