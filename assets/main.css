@@ -71,6 +71,7 @@ body {
 }
 
 .welcome-card { width: 520px; text-align: center; }
+.welcome-corner { position: absolute; top: 14px; right: 16px; }
 
 .welcome-card h1 {
     font-size: 28px;
@@ -990,3 +991,17 @@ button.update-banner-link {
 }
 .skipped-name { color: var(--text2); white-space: nowrap; }
 .skipped-why { color: var(--text3); }
+
+/* desktop-kit's banners and connect window, in this app's colours. On body,
+   where the light theme's class is, so they follow it. No kit header here:
+   the banners sit at the very top, where the update banner used to. */
+body {
+    --kit-header-h: 0px;
+    --kit-accent: var(--blue-bg);
+    --kit-bar: var(--bg1);
+    --kit-bg: var(--bg0);
+    --kit-hover: var(--bg2);
+    --kit-line: var(--border);
+    --kit-muted: var(--text2);
+    --kit-text: var(--text1);
+}

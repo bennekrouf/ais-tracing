@@ -112,6 +112,8 @@ pub fn Welcome() -> Element {
 
     rsx! {
         div { class: "welcome",
+            // Top right, out of the way of the account picker.
+            div { class: "welcome-corner", crate::McpButton { class: "btn" } }
             div { class: "welcome-card",
                 h1 { "AIS Tracing" }
                 p { class: "subtitle", "Azure Cosmos DB — correlation-key flow explorer" }

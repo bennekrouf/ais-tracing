@@ -1,8 +1,8 @@
-mod notice;
+mod kit;
+mod mcp;
 mod screens;
 mod services;
 mod telemetry;
-mod update_check;
 
 use dioxus::desktop::LogicalSize;
 use dioxus::prelude::*;
@@ -92,6 +92,12 @@ fn main() {
         }
     }
 
+    kit::init();
+    // `ais-tracing mcp`: the tools over stdio for an MCP client, and no window.
+    if std::env::args().nth(1).as_deref() == Some("mcp") {
+        return mcp::serve();
+    }
+
     let cfg = window_config(concat!("AIS Tracing ", env!("CARGO_PKG_VERSION")));
     dioxus::LaunchBuilder::desktop().with_cfg(cfg).launch(App);
 }
@@ -113,36 +119,10 @@ fn WindowRoot(initial: Option<CosmosAccount>) -> Element {
         dark_light::detect().unwrap_or(dark_light::Mode::Dark) != dark_light::Mode::Dark;
     let is_light = use_signal(|| system_light);
 
-    // ── Auto-update check ──────────────────────────────────────────────────
-    // Deliberately after a delay and entirely best-effort: a release check is
-    // never worth slowing a cold start, and a failed one is not worth saying
-    // anything about.
-    // ── Notice from mayorana.ch ────────────────────────────────────────────
-    // A message to the people running this build (see notice.rs). Same
-    // posture as the update check: delayed, best-effort, silent on failure.
-    let mut mayorana_notice = use_signal(|| Option::<notice::Notice>::None);
-    use_coroutine(
-        move |_rx: dioxus::prelude::UnboundedReceiver<()>| async move {
-            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
-            if let Some(n) = notice::fetch().await {
-                mayorana_notice.set(Some(n));
-            }
-        },
-    );
-
-    let mut update_info = use_signal(|| Option::<update_check::UpdateInfo>::None);
-    let mut update_dismissed = use_signal(|| false);
-    use_coroutine(
-        move |_rx: dioxus::prelude::UnboundedReceiver<()>| async move {
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-            if let Some(info) = update_check::check().await {
-                telemetry::record(telemetry::Event::UpdateOffered {
-                    to: info.latest_version.clone(),
-                });
-                update_info.set(Some(info));
-            }
-        },
-    );
+    // The update and notice banners are desktop-kit's (see `Banners` below):
+    // "Install & restart" where this copy can replace itself.
+    let mut connect_open = use_signal(|| false);
+    use_context_provider(|| ConnectOpen(connect_open));
 
     use_effect(move || {
         // Serialised as a JSON string rather than pasted into a template
@@ -186,29 +166,22 @@ fn WindowRoot(initial: Option<CosmosAccount>) -> Element {
     });
 
     rsx! {
-        // Update banner — fixed top, dismissable per session.
-        if let (Some(info), false) = (update_info.read().clone(), *update_dismissed.read()) {
-            div { class: "update-banner",
-                span { class: "update-banner-text",
-                    "AIS Tracing "
-                    strong { "{info.latest_version}" }
-                    " is available (you have {env!(\"CARGO_PKG_VERSION\")})."
-                }
-                a {
-                    class: "update-banner-link",
-                    href: "{info.release_url}",
-                    target: "_blank",
-                    onclick: {
-                        let to = info.latest_version.clone();
-                        move |_| telemetry::record(telemetry::Event::UpdateClicked { to: to.clone() })
-                    },
-                    "Download"
-                }
-                button {
-                    class: "update-banner-dismiss",
-                    onclick: move |_| update_dismissed.set(true),
-                    "×"
-                }
+        // A newer release and the notice from mayorana.ch, at the top.
+        // AIS Tracing counts the update events in its own statistics.
+        desktop_kit::ui::Banners {
+            on_update_offered: move |to| telemetry::record(telemetry::Event::UpdateOffered { to }),
+            on_update_clicked: move |to| telemetry::record(telemetry::Event::UpdateClicked { to }),
+        }
+
+        if connect_open() {
+            desktop_kit::ui::ConnectWindow {
+                lead: "Claude can list your Cosmos DB accounts, sample their containers, find the \
+                       fields that link documents together and follow a value through them, \
+                       the way this window does. It only reads.",
+                try_it: "\u{201c}Where did order 12345 get to in my Cosmos DB account?\u{201d}",
+                caution: "Claude reads Azure as your signed-in az account, and the documents it \
+                          traces go to the AI model you use with it.".to_string(),
+                on_close: move |_| connect_open.set(false),
             }
         }
 
@@ -240,35 +213,6 @@ fn WindowRoot(initial: Option<CosmosAccount>) -> Element {
             }
         }
 
-        // Notice from mayorana.ch — shown until dismissed, then remembered.
-        if let Some(n) = mayorana_notice.read().clone() {
-            {
-                let id = n.id.clone();
-                let link_text = n.link_text.clone().unwrap_or_else(|| "Open".to_string());
-                rsx! {
-                    div { class: "update-banner notice-banner",
-                        span { class: "update-banner-text", "{n.text}" }
-                        if let Some(url) = n.url.clone() {
-                            a {
-                                class: "update-banner-link",
-                                href: "{url}",
-                                target: "_blank",
-                                "{link_text}"
-                            }
-                        }
-                        button {
-                            class: "update-banner-dismiss",
-                            onclick: move |_| {
-                                notice::dismiss(&id);
-                                mayorana_notice.set(None);
-                            },
-                            "×"
-                        }
-                    }
-                }
-            }
-        }
-
         match current {
             None => rsx! { Welcome {} },
             Some(acc) => rsx! {
@@ -280,6 +224,26 @@ fn WindowRoot(initial: Option<CosmosAccount>) -> Element {
                     on_back: move |_| account.set(None),
                 }
             },
+        }
+    }
+}
+
+/// Whether the "Use AIS Tracing from Claude" window is open, shared with the
+/// screens so each can put the MCP button in its own bar.
+#[derive(Clone, Copy)]
+pub struct ConnectOpen(pub Signal<bool>);
+
+/// The MCP button: opens the window that adds AIS Tracing to Claude Desktop,
+/// Claude Code, Codex or VS Code.
+#[component]
+pub fn McpButton(class: String) -> Element {
+    let ConnectOpen(mut open) = use_context::<ConnectOpen>();
+    rsx! {
+        button {
+            class: "{class}",
+            title: "Use AIS Tracing from Claude Desktop, Claude Code, Codex or VS Code",
+            onclick: move |_| open.set(true),
+            "MCP"
         }
     }
 }
