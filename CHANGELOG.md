@@ -15,6 +15,13 @@ Each heading is dated on the day its tag was pushed. Releases that carried only
 build or packaging work say so rather than being hidden: the version numbers a
 user sees in the update prompt should all be accounted for.
 
+## [Unreleased]
+
+### Fixed
+
+- Version 0.1.32 had no Windows download: its Windows build failed. This
+  release brings the **MCP** button and **Install & restart** to Windows.
+
 ## [0.1.32] - 2026-11-26
 
 ### Added
