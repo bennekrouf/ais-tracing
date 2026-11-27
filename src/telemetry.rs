@@ -176,7 +176,9 @@ fn login_env(name: &str) -> Option<String> {
 
 /// `KEY=value` lines from the shell, keeping only the opt-out variables. A
 /// profile that prints its own output (nvm, conda, banners) cannot smuggle
-/// anything else in, because only these names are accepted.
+/// anything else in, because only these names are accepted. Windows has no
+/// login shell to ask, so there only the tests call it.
+#[cfg(any(unix, test))]
 fn parse_login_env(text: &str) -> BTreeMap<String, String> {
     text.lines()
         .filter_map(|line| line.split_once('='))
